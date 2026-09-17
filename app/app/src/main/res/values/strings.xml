@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">自助打印</string>
+
+    <string name="server_title">服务器设置</string>
+    <string name="server_msg">填写打印网关的地址（IP 或 IP:端口）。同一局域网内即可。</string>
+    <string name="token_hint">访问口令（网关未设口令则留空）</string>
+    <string name="save_connect">保存并连接</string>
+    <string name="cancel">取消</string>
+    <string name="reload">重新加载</string>
+
+    <string name="retry">重试</string>
+    <string name="upload_failed">上传失败</string>
+    <string name="busy">正在上传，请稍候</string>
+    <string name="host_empty">地址不能为空</string>
+    <string name="need_server_first">请先填写打印服务器地址</string>
+
+    <string name="uploading">正在上传 %1$d 个文件…</string>
+    <string name="uploading_pct">正在上传 %1$d%%</string>
+
+    <string name="scan_title">扫码连接</string>
+    <string name="scan_btn">扫码连接</string>
+    <string name="scan_hint">对准打印网关的二维码（内容是 http://IP:端口/?t=口令 的连接码）</string>
+    <string name="scan_permission_needed">没有相机权限，无法扫码。请到系统设置里开启相机权限。</string>
+    <string name="scan_bad_qr">不是有效的连接二维码。码的内容应为 http://IP:端口（可带 ?t=口令）</string>
+    <string name="scan_no_camera">这台设备没有可用的相机</string>
+</resources>

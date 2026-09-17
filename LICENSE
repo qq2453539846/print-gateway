@@ -1,0 +1,32 @@
+# 许可协议（License）
+
+本项目（服务端 print_gateway 与安卓 App print-selfservice 全部代码、文档、资源）
+在 **Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)**
+许可下发布。
+
+## 你可以
+
+- 学习、阅读、修改本代码
+- 在**非商业目的**下自由使用（个人自用、学校教学、开源社区贡献等）
+- 基于本代码派生作品，只要同样以 CC BY-NC 4.0 发布并署名
+
+## 你不可以
+
+- **将本代码用于任何商业目的**：包括但不限于
+  提供收费服务、用于公司/企业/个体户的生产与经营、
+  嵌入任何商业化产品或 SaaS 中。
+- 删除本许可声明，或暗示作者为用途背书
+
+## 署名要求
+
+使用或修改本代码时，请保留：
+  Copyright (c) 2026 print-gateway authors
+  License: CC BY-NC 4.0
+
+完整 CC BY-NC 4.0 文本：
+  https://creativecommons.org/licenses/by-nc/4.0/legalcode
+
+## 免责声明
+
+本代码按「现状」提供，无任何担保。使用者对使用本代码造成的一切后果
+（包括对打印机硬件、打印耗材与数据的损害）自行负责。

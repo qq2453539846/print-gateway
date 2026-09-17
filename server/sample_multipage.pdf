@@ -1,0 +1,102 @@
+%PDF-1.4
+0 0 obj
+<< /Title (Print Gateway E2E Test) >>
+endobj
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R 6 0 R 8 0 R] /Count 3 >>
+endobj
+3 0 obj
+<< /Length 337 >>
+stream
+BT
+/F1 12 Tf
+16 TL
+56 780 Td
+(Print Gateway - End to End Test) Tj T*
+() Tj T*
+(Page 1 of 3) Tj T*
+() Tj T*
+(This document verifies:) Tj T*
+(  upload -> convert -> CUPS queue -> backend) Tj T*
+() Tj T*
+(If you can read this, the pipeline works.) Tj T*
+() Tj T*
+(----------------------------------------) Tj T*
+(E2E-TEST-MARKER-1) Tj T*
+ET
+endstream
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 9 0 R >> >> /Contents 3 0 R >>
+endobj
+5 0 obj
+<< /Length 337 >>
+stream
+BT
+/F1 12 Tf
+16 TL
+56 780 Td
+(Print Gateway - End to End Test) Tj T*
+() Tj T*
+(Page 2 of 3) Tj T*
+() Tj T*
+(This document verifies:) Tj T*
+(  upload -> convert -> CUPS queue -> backend) Tj T*
+() Tj T*
+(If you can read this, the pipeline works.) Tj T*
+() Tj T*
+(----------------------------------------) Tj T*
+(E2E-TEST-MARKER-2) Tj T*
+ET
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 9 0 R >> >> /Contents 5 0 R >>
+endobj
+7 0 obj
+<< /Length 337 >>
+stream
+BT
+/F1 12 Tf
+16 TL
+56 780 Td
+(Print Gateway - End to End Test) Tj T*
+() Tj T*
+(Page 3 of 3) Tj T*
+() Tj T*
+(This document verifies:) Tj T*
+(  upload -> convert -> CUPS queue -> backend) Tj T*
+() Tj T*
+(If you can read this, the pipeline works.) Tj T*
+() Tj T*
+(----------------------------------------) Tj T*
+(E2E-TEST-MARKER-3) Tj T*
+ET
+endstream
+endobj
+8 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 9 0 R >> >> /Contents 7 0 R >>
+endobj
+9 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+xref
+0 10
+0000000000 65535 f 
+0000000062 00000 n 
+0000000111 00000 n 
+0000000180 00000 n 
+0000000568 00000 n 
+0000000694 00000 n 
+0000001082 00000 n 
+0000001208 00000 n 
+0000001596 00000 n 
+0000001722 00000 n 
+trailer
+<< /Size 10 /Root 1 0 R /Info 0 0 R >>
+startxref
+1792
+%%EOF
