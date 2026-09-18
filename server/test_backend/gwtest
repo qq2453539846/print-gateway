@@ -1,0 +1,34 @@
+#!/bin/sh
+#
+# gwtest - CUPS 测试后端：把打印任务数据写入文件，不经过真实硬件。
+#
+# 用途：在没有物理打印机的情况下验证「上传 -> 转换 -> 队列 -> 后端」整条链路。
+# 生产环境不使用这个后端。
+#
+# CUPS 后端调用约定：
+#   $1=job-id  $2=user  $3=title  $4=copies  $5=options  $6=文件名(可能为空)
+#   若 $6 为空，则从 stdin 读取任务数据
+#   环境变量 DEVICE_URI 形如 gwtest:/任意后缀
+
+OUTDIR="${GW_TEST_OUTDIR:-/tmp/gwtest}"
+mkdir -p "$OUTDIR" 2>/dev/null
+chmod 777 "$OUTDIR" 2>/dev/null
+
+JOBID="${1:-0}"
+TITLE="${3:-untitled}"
+STAMP=$(date +%s)
+SAFE=$(echo "$TITLE" | tr -c 'A-Za-z0-9._-' '_')
+OUT="$OUTDIR/job${JOBID}_${STAMP}_${SAFE}.prn"
+
+if [ -n "$6" ] && [ -f "$6" ]; then
+    cat "$6" > "$OUT" 2>/dev/null
+else
+    cat > "$OUT" 2>/dev/null
+fi
+
+SIZE=$(wc -c < "$OUT" 2>/dev/null || echo 0)
+echo "INFO: gwtest wrote $OUT ($SIZE bytes) uri=$DEVICE_URI" >&2
+
+# 回报页数，便于 CUPS 记账
+echo "PAGE: 1 1"
+exit 0

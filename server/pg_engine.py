@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from dataclasses import dataclass, field, asdict
 
 import pg_decor
@@ -57,8 +58,27 @@ MAX_COPIES = 99
 MAX_MARGIN_MM = 50.0
 DEFAULT_DPI = 300
 PREVIEW_DPI = 72
+# 预览构建用的分辨率。栅格拼版的时间基本正比于像素数，而预览图最后就是按
+# PREVIEW_DPI 渲染出来的 —— 按出纸分辨率（默认 300）构建纯属白烧 CPU。
+# 实测 10 页小册子：300dpi 构建 20.1s -> 144dpi 构建 6.3s，而预览 PNG 尺寸
+# 一模一样、平均像素差 0.3~0.7/255（差别只在文字边缘的抗锯齿上）。
+# 取 2 倍而不是 1 倍：让最后那步缩放是干净的 2:1，宁可多几个像素也别省到糊。
+PREVIEW_BUILD_DPI = PREVIEW_DPI * 2
 PREVIEW_MAX_PAGES = 40
 RENDER_WORKERS = 3                     # 板子只有 988MB 内存，栅格化不宜过度并发
+
+# 预览并行度：这台板子是 4 核，**故意只用 3 个**，留 1 核给 HTTP 服务与
+# 其他在用功能 —— 预览是「响应在线请求」的路径，把整机占满会导致别的
+# 请求卡住、SSH 也发涩。实测 10 页 A4 3.39s -> 1.52s，40 页 13.0s -> 4.8s。
+PREVIEW_WORKERS = 3
+# 每片至少 2 页：pdftoppm 每次启动都要重新解析文档、加载字体，
+# 页数太少时并行反而不划算（启动开销盖过省下的渲染时间）。
+PREVIEW_MIN_CHUNK = 2
+# 全局闸：**同时在跑的 pdftoppm 进程总数**不超过 PREVIEW_WORKERS。
+# 只限单请求的并行度是不够的 —— 三个人同时点预览就是 3 x 3 个进程，
+# 照样能把 4 核压满。多出来的分片在这里排队等槽位，宁可各自慢一点，
+# 也不让谁把整台设备拖死（特别是还要留着 SSH 能进得去）。
+_PREVIEW_GATE = threading.Semaphore(PREVIEW_WORKERS)
 
 
 # ------------------------------------------------------------------ 规格
@@ -184,9 +204,29 @@ class PrintSpec:
         # \s 会把换行也算作空白，让带换行的输入穿过这道闸门。
         if self.page_range and not re.fullmatch(r"[0-9,\- \t]+", self.page_range):
             raise ValueError("页码范围只能包含数字、逗号、连字符和空格")
-        if self.booklet and self.per_sheet != 1:
+        if self.booklet:
             # 小册子固定 2 版，忽略用户的每版页数而不是报错
             self.per_sheet = 1
+            # 小册子的双面档位是**几何决定**的，同样不接受用户的选择：
+            #
+            #   判据只有一句：**翻面轴必须与折线平行**。
+            #
+            #   小册子的纸被强制横向（见 pg_layout.build_plan），折线是竖直中线，
+            #   所以要绕**竖直**轴翻面 —— 竖直边就是短边（210mm），即「短边翻页」。
+            #
+            #   用「长边翻页」（绕水平的 297mm 边翻）会怎样：打印机把背面的
+            #   左格放到物理左半张上，于是纸页配对被整体错开半张 —— 8 页册子里
+            #   封面那张纸会变成「正面 1 · 背面 7」而不是「1 · 2」，装订出来
+            #   页码全乱（不是「倒过来」那么明显，是彻底串页）。
+            #
+            #   拼版（booklet_sides）画的就是「绕折线翻面」那一份，所以只能配
+            #   短边翻页。之前这里是原样透传用户的选项，而面板默认「单面」——
+            #   于是「勾上小册子直接印」会得到 4 张单面散页，装订顺序全废。
+            #
+            # 只印正面/背面（手动双面）时反过来必须是单面：两次各印一遍，若开双面，
+            # 同一张纸的正反面会各印一个「正面」。
+            self.duplex = ("one-sided" if self.booklet_subset in ("front", "back")
+                           else "two-sided-short-edge")
 
         # 裁剪量：越界夹住、非数字归零，然后写回规范化结果，
         # 这样 cache_key 对「10」与「10.0」是一致的
@@ -478,16 +518,67 @@ def impose(src: str, out: str, plan: dict, dpi: int, grayscale: bool, workdir: s
 
 
 # ------------------------------------------------------------------ 4. 预览与打印
+def _preview_chunks(limit: int, workers: int = PREVIEW_WORKERS,
+                    min_pages: int = PREVIEW_MIN_CHUNK) -> list[tuple[int, int]]:
+    """
+    把 1..limit 切成若干**连续**页区间，供并行渲染。
+
+    并行度取 min(workers, limit // min_pages)：页数太少就不并行。切出来
+    的区间互不重叠，各片按自己的 -f/-l 输出，因此不会重复渲染同一页。
+    """
+    if limit <= 0:
+        return []
+    n = max(1, min(workers, limit // min_pages))
+    base, extra = divmod(limit, n)
+    spans: list[tuple[int, int]] = []
+    start = 1
+    for i in range(n):
+        size = base + (1 if i < extra else 0)
+        spans.append((start, start + size - 1))
+        start += size
+    return spans
+
+
 def make_preview(pdf: str, workdir: str, dpi: int = PREVIEW_DPI,
-                 max_pages: int = PREVIEW_MAX_PAGES) -> list[str]:
-    """把最终 PDF 渲染成预览图 —— 预览渲染的就是即将送印的同一个文件。"""
+                 max_pages: int = PREVIEW_MAX_PAGES,
+                 workers: int = PREVIEW_WORKERS) -> list[str]:
+    """
+    把最终 PDF 渲染成预览图 —— 预览渲染的就是即将送印的同一个文件。
+
+    按页拆片并行渲染（默认 3 片，留 1 核给服务，见 PREVIEW_WORKERS）。
+    之所以能这么干：pdftoppm 的 `-f/-l` 只决定**渲染哪几页**，输出文件名
+    始终按**源页号**编号 —— `-f 4 -l 6` 产出 preview-04/05/06.png，与
+    `-f 1 -l 12` 的同一页文件名完全相同。所以多片共用一个 prefix 也不会
+    互相覆盖，收集排序逻辑与单进程时一模一样，对外返回的页号顺序不变。
+
+    分片本身不改变渲染结果：同一页不管落在哪一片，都是同样的命令、同样的
+    参数，机器上实测逐字节一致（见 verify_preview.py）。
+    """
     count, _ = pdf_info(pdf)
     limit = min(count, max_pages)
+    if limit <= 0:
+        return []
     prefix = os.path.join(workdir, "preview")
-    cmd = [PDFTOPPM, "-f", "1", "-l", str(limit), "-r", str(dpi), "-png", pdf, prefix]
-    rc, txt = run(cmd, timeout=300)
-    if rc != 0:
-        raise EngineError("预览渲染失败：%s" % txt.strip()[:200])
+    spans = _preview_chunks(limit, workers)
+
+    def one(span: tuple[int, int]) -> str:
+        first, last = span
+        cmd = [PDFTOPPM, "-f", str(first), "-l", str(last),
+               "-r", str(dpi), "-png", pdf, prefix]
+        with _PREVIEW_GATE:                    # 全局限流，见常量处说明
+            rc, txt = run(cmd, timeout=300)
+        if rc != 0:
+            return "预览渲染失败（第 %d-%d 页）：%s" % (first, last, txt.strip()[:120])
+        return ""
+
+    if len(spans) <= 1:
+        err = one(spans[0]) if spans else ""
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=len(spans)) as pool:
+            err = next((e for e in pool.map(one, spans) if e), "")
+    if err:
+        raise EngineError(err)
     files = sorted(glob.glob(prefix + "*.png"),
                    key=lambda p: int(re.search(r"(\d+)\.png$", p).group(1)))
     return files
@@ -557,15 +648,26 @@ def _today() -> str:
     return time.strftime("%Y-%m-%d")
 
 
-def build_final(spec: PrintSpec, src_pdf: str, workdir: str) -> dict:
+def build_final(spec: PrintSpec, src_pdf: str, workdir: str,
+                preview: bool = False) -> dict:
     """
     把源 PDF 按设置处理成最终 PDF。
 
     返回 {"pdf","plan","mode","pages","sheet","notes"}
     mode 为 "vector"（矢量直出）/ "raster"（栅格拼版）/ "tile"（分割打印）。
+
+    preview=True 时按 `PREVIEW_BUILD_DPI` 构建，供**只看预览、不马上出纸**的
+    场合用：预览图最终是 72dpi 的，按出纸 dpi 拼一遍再缩下去纯属浪费
+    （实测 10 页小册子 20.1s -> 6.3s）。
+
+    这么做**不会改变版面**：拼版几何（placement 的 x/y/w/h，单位点）只由
+    设置与源页尺寸决定，dpi 只影响 render_jobs 算出来的像素块大小。所以
+    预览看到的页序、位置、缩放与出纸完全一致，只是像素密度低一档。
+    notes 里的「单页渲染分辨率」仍按**出纸**分辨率报 —— 那是用户关心的数。
     """
     os.makedirs(workdir, exist_ok=True)
     notes: list[str] = []
+    build_dpi = PREVIEW_BUILD_DPI if preview else spec.dpi
 
     dec = pg_decor.Decor.from_dict(spec.decor)
     today = _today()
@@ -631,7 +733,7 @@ def build_final(spec: PrintSpec, src_pdf: str, workdir: str) -> dict:
     final = os.path.join(workdir, "final.pdf")
     info = {}
     if need_raster:
-        info = impose(norm, final, plan, spec.dpi, spec.grayscale, workdir,
+        info = impose(norm, final, plan, build_dpi, spec.grayscale, workdir,
                       decor=dec, labels=labels, total_pages=total, today=today)
         srows, scols = plan["split"]
         if srows * scols > 1:
@@ -640,9 +742,17 @@ def build_final(spec: PrintSpec, src_pdf: str, workdir: str) -> dict:
                          % (srows, scols, plan["pages_used"] * srows * scols))
         else:
             mode = "raster"
+            # 报「出纸档」的分辨率：预览档构建时 build_dpi 偏低，照实报会误导。
+            # 拿 spec.dpi 再算一遍 render_jobs（纯计算，不渲染）比按比例换算准 ——
+            # 比例换算里有 round，边界上会差 1（212 vs 213），面板上就是「数字怎么变了」。
+            if preview:
+                rdpi = sorted({j["dpi"]
+                               for j in pg_layout.render_jobs(plan, spec.dpi)})
+            else:
+                rdpi = sorted(set(info["render_dpi"]))
             notes.append("拼版处理：%d 版/张，单页渲染分辨率约 %s dpi"
                          % (spec.per_sheet if not spec.booklet else 2,
-                            ",".join(str(d) for d in sorted(set(info["render_dpi"]))[:3])))
+                            ",".join(str(d) for d in rdpi[:3])))
         if spec.scale_mode == "stretch":
             notes.append("缩放方式：拉伸铺满（按版心比例非等比拉伸，可消除白边）")
         if pg_layout.has_crop(plan["crop"]):
@@ -666,6 +776,16 @@ def build_final(spec: PrintSpec, src_pdf: str, workdir: str) -> dict:
         shutil.copyfile(norm, final)
         mode = "vector"
         notes.append("矢量直出：文字保持矢量，未经栅格化")
+
+    if spec.booklet:
+        # 双面档位已在 validate() 里被改成几何要求的那个值，这里必须**说出来** ——
+        # 用户明明选了「长边翻页」却被改掉，不告知就又是一次静默行为变化。
+        notes.append("小册子：横向对折（%s装订）· %s"
+                     % ("左" if spec.booklet_binding == "left" else "右",
+                        "出纸用短边翻页双面"
+                        if spec.booklet_subset == "both"
+                        else "仅印%s，出纸为单面"
+                             % ("正面" if spec.booklet_subset == "front" else "背面")))
 
     out_count, _ = pdf_info(final)
     return {

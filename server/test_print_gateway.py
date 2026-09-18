@@ -6,6 +6,8 @@ print_gateway 核心逻辑测试。
 """
 
 import os
+import shutil
+import socket
 import sys
 import unittest
 from unittest import mock
@@ -15,8 +17,10 @@ import re                                                     # noqa: E402
 import tempfile                                               # noqa: E402
 
 import print_gateway as pg                                    # noqa: E402
+import pg_admin                                               # noqa: E402
 import pg_decor                                               # noqa: E402
 import pg_engine                                              # noqa: E402
+import pg_layout                                              # noqa: E402
 from pg_engine import PrintSpec                               # noqa: E402
 
 
@@ -292,6 +296,59 @@ class TestPageTemplate(unittest.TestCase):
         body = pg.PAGE.split("function syncUI(){", 1)[1].split("\n}", 1)[0]
         self.assertIn("$('#perSheet').disabled", body)
         self.assertIn("$('#booklet').disabled", body)
+
+    def test_booklet_uses_icon_buttons_not_selects(self):
+        """
+        小册子的两个选项由下拉改成了图标按钮。
+
+        参数名必须仍是 bookletBinding / bookletSubset —— 后端、缓存键、控件
+        绑定清单都按这两个名字取值，换了名字会「界面能点但实际不生效」。
+        """
+        self.assertIn('id="bookletBinding" value="left"', pg.PAGE)
+        self.assertIn('id="bookletSubset" value="both"', pg.PAGE)
+        self.assertNotIn('<select id="booklet', pg.PAGE)
+        self.assertEqual(pg.PAGE.count('data-for="bookletBinding"'), 2)
+        self.assertEqual(pg.PAGE.count('data-for="bookletSubset"'), 3)
+
+    def test_booklet_buttons_write_back_and_refresh(self):
+        """图标按钮要把值写回隐藏输入框并触发 change，否则改了不刷新预览。"""
+        self.assertIn("bkPick(b.getAttribute('data-for')", pg.PAGE)
+        self.assertIn("sel.dispatchEvent(new Event('change'))", pg.PAGE)
+        self.assertIn("bkPaint();", pg.PAGE.split("function syncUI(){", 1)[1])
+
+    def test_booklet_summary_matches_engine_pairing(self):
+        """
+        缩略示意的页号必须与引擎实际拼版一致。
+
+        两边各算一遍的话，图迟早开始骗人 —— 那比没有图更糟。
+        """
+        for n in (1, 2, 4, 6, 8, 14, 40):
+            s = pg.booklet_summary(n)
+            sides = pg_layout.booklet_sides(n, "left", "both")
+            self.assertEqual(s["padded"], -(-n // 4) * 4)
+            self.assertEqual(s["sheets"], s["padded"] // 4)
+            self.assertEqual(s["blank"], s["padded"] - n)
+            self.assertEqual(
+                s["faces"],
+                [{k: f[k] for k in ("sheet", "kind", "left", "right")}
+                 for f in sides[:2]], "页数 %d" % n)
+        self.assertEqual(pg.booklet_summary(0),
+                         {"padded": 0, "sheets": 0, "blank": 0, "faces": []})
+
+    def test_right_binding_is_just_a_swap(self):
+        """
+        右装订 = 每面左右对调。
+
+        前端只做这个「对调」，配对公式一概留在后端 —— 这条测试就是那份等价
+        性的证明，前端可以放心不做计算。
+        """
+        for n in (4, 8, 12):
+            left = pg.booklet_summary(n)["faces"]
+            right = [{k: f[k] for k in ("sheet", "kind", "left", "right")}
+                     for f in pg_layout.booklet_sides(n, "right", "both")[:2]]
+            swapped = [{"sheet": f["sheet"], "kind": f["kind"],
+                        "left": f["right"], "right": f["left"]} for f in left]
+            self.assertEqual(swapped, right, "页数 %d" % n)
 
     def test_mode_labels_cover_all_engine_modes(self):
         """引擎会返回 vector / raster / tile 三种模式，界面都得认得。"""
@@ -588,6 +645,491 @@ class TestAppDownload(unittest.TestCase):
         import inspect
         src = inspect.getsource(pg.main)
         self.assertIn('Handler.apk_path = args.apk', src)
+
+
+class TestPreviewBuildSplit(unittest.TestCase):
+    """
+    预览档与出纸档分开构建：预览走 PREVIEW_BUILD_DPI（快），出纸走 spec.dpi（清晰）。
+
+    两档必须各有各的缓存槽与工作目录 —— 最坏的失败形态是「先预览再打印」时
+    把 144dpi 的产物送进打印队列：纸照样出得来，只是糊，没人会当场发现。
+    """
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="pgw_")
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        saved = pg.Handler.store
+        pg.Handler.store = pg.JobStore(self.root)
+        self.addCleanup(setattr, pg.Handler, "store", saved)
+        pg._CACHE.clear()
+        self.addCleanup(pg._CACHE.clear)
+
+        self.h = object.__new__(pg.Handler)      # 只借 _build，不用起 socket
+        self.job = pg.Handler.store.create()
+        self.job.source_pdf = os.path.join(self.root, "src.pdf")
+        open(self.job.source_pdf, "wb").close()
+        self.calls = []
+
+    def _patch(self):
+        def fake_build(spec, src, workdir, preview=False):
+            self.calls.append({"preview": preview, "work": workdir,
+                               "dpi": pg_engine.PREVIEW_BUILD_DPI if preview
+                               else spec.dpi})
+            os.makedirs(workdir, exist_ok=True)
+            pdf = os.path.join(workdir, "final.pdf")
+            open(pdf, "wb").close()
+            return {"pdf": pdf, "plan": {}, "mode": "raster", "pages": 6,
+                    "source_pages": 10, "sheet": (842.0, 595.0), "notes": []}
+
+        def fake_preview(pdf, workdir, *a, **kw):
+            out = []
+            for n in (1, 2):
+                p = os.path.join(workdir, "preview-%d.png" % n)
+                open(p, "wb").close()
+                out.append(p)
+            return out
+
+        mock.patch.object(pg_engine, "build_final",
+                          side_effect=fake_build).start()
+        self.addCleanup(mock.patch.stopall)
+        mock.patch.object(pg_engine, "make_preview",
+                          side_effect=fake_preview).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def _spec(self, dpi=300):
+        spec = PrintSpec.from_form({"paper": "A4", "dpi": dpi})
+        spec.validate()
+        return spec
+
+    def test_preview_build_is_flagged_preview(self):
+        self._patch()
+        self.h._build(self.job, self._spec(), with_preview=True)
+        self.assertEqual([c["preview"] for c in self.calls], [True])
+        self.assertEqual(self.calls[0]["dpi"], pg_engine.PREVIEW_BUILD_DPI)
+
+    def test_print_build_uses_full_dpi(self):
+        self._patch()
+        self.h._build(self.job, self._spec(), with_preview=False)
+        self.assertEqual([c["preview"] for c in self.calls], [False])
+        self.assertEqual(self.calls[0]["dpi"], 300)
+
+    def test_preview_then_print_builds_twice_in_separate_dirs(self):
+        self._patch()
+        spec = self._spec()
+        pv = self.h._build(self.job, spec, with_preview=True)
+        pr = self.h._build(self.job, spec, with_preview=False)
+
+        self.assertEqual([c["preview"] for c in self.calls], [True, False])
+        self.assertNotEqual(self.calls[0]["work"], self.calls[1]["work"])
+        self.assertNotEqual(pv["pdf"], pr["pdf"])
+        self.assertTrue(pv["images"])
+        self.assertFalse(pr["images"])
+
+    def test_print_never_hands_back_the_preview_file(self):
+        """先预览再打印，进队列的必须是出纸档 —— 这条错了就是「能出纸但糊」。"""
+        self._patch()
+        spec = self._spec()
+        preview_pdf = self.h._build(self.job, spec, with_preview=True)["pdf"]
+        print_pdf = self.h._build(self.job, spec, with_preview=False)["pdf"]
+        self.assertNotEqual(print_pdf, preview_pdf)
+        self.assertIn("final.pdf", print_pdf)
+        self.assertNotIn(pg._PV, print_pdf)
+
+    def test_each_slot_is_cached_independently(self):
+        self._patch()
+        spec = self._spec()
+        self.h._build(self.job, spec, with_preview=True)
+        self.h._build(self.job, spec, with_preview=True)
+        self.h._build(self.job, spec, with_preview=False)
+        self.h._build(self.job, spec, with_preview=False)
+        self.assertEqual([c["preview"] for c in self.calls], [True, False])
+
+    def test_preview_dir_matches_the_fallback_serve_image_uses(self):
+        """
+        /img 在缓存被挤掉时会直接去磁盘上找 build-<slot>/preview-N.png，
+        目录名必须和这里落盘的一致，否则预览会整片 404。
+        """
+        self._patch()
+        spec = self._spec()
+        self.h._build(self.job, spec, with_preview=True)
+        key = spec.cache_key()
+        pv_dir = os.path.join(self.job.dir, "build-" + key + pg._PV)
+        self.assertTrue(os.path.exists(os.path.join(pv_dir, "preview-1.png")))
+        self.assertTrue(os.path.exists(os.path.join(pv_dir, "final.pdf")))
+
+        # 出纸档落在不带后缀的目录里，就是 /img 回退时先找的那个
+        self.h._build(self.job, spec, with_preview=False)
+        self.assertTrue(os.path.exists(
+            os.path.join(self.job.dir, "build-" + key, "final.pdf")))
+
+    def test_preview_slot_key_is_not_a_valid_url_key(self):
+        """缓存槽后缀只存在于服务端：URL 里的 k 必须仍是纯 16 位十六进制。"""
+        self._patch()
+        spec = self._spec()
+        entry = self.h._build(self.job, spec, with_preview=True)
+        self.assertTrue(pg.HASH_RE.match(spec.cache_key()))
+        self.assertFalse(pg.HASH_RE.match(spec.cache_key() + pg._PV))
+        self.assertTrue(entry["images"])
+
+
+class TestAdminAccess(unittest.TestCase):
+    """
+    `/admin` 的三道关：**只许内网** → **必须配了口令** → **口令校验**。
+
+    这个页面能改 DNS、能签证书、能看到域名配置，暴露在公网上等于把
+    DNSPod 令牌交出去。所以判据要一条条钉住。
+    """
+
+    def _handler(self, path, client="192.168.1.50", admin_token="s3cret",
+                 cookie=None, header=None, body=None):
+        h = pg.Handler.__new__(pg.Handler)         # 不跑 __init__，避免真开端口
+        h.path = path
+        h.client_address = (client, 43210)
+        h.admin_token = admin_token
+        h.tls_enabled = True
+        h.tls_port = 8443
+        h.headers = {}
+        if cookie is not None:
+            h.headers["Cookie"] = cookie
+        if header is not None:
+            h.headers["X-Admin-Token"] = header
+        sent = {}
+        h._send = lambda code, b, ctype, extra=None: sent.update(
+            code=code, body=b, ctype=ctype, extra=extra or {})
+        h._err = lambda msg, code=400: sent.update(code=code, obj={"error": msg})
+        h._json = lambda obj, code=200: sent.update(code=code, obj=obj)
+        h._json_body = lambda: (body or {})
+        return h, sent
+
+    def _good_cookie(self, token="s3cret"):
+        h, _ = self._handler("/admin", admin_token=token)
+        return "pg_admin=" + h._admin_cookie()
+
+    # ---------------------------------------------------- 第一道关：内网
+    def test_public_source_gets_404_even_with_correct_token(self):
+        """公网来源一律 404 —— 连「这里有管理页」都不该被知道。"""
+        for client in ("1.2.3.4", "8.8.8.8", "2001:4860:4860::8888"):
+            h, sent = self._handler("/admin?t=s3cret", client=client)
+            h._admin_dispatch("/admin", False)
+            self.assertEqual(sent["code"], 404, client)
+            self.assertIn("error", sent["obj"])
+
+    def test_public_source_gets_404_on_api_too(self):
+        h, sent = self._handler("/admin/api/status", client="1.2.3.4",
+                                cookie=self._good_cookie())
+        h._admin_dispatch("/admin/api/status", False)
+        self.assertEqual(sent["code"], 404)
+
+    def test_lan_source_is_allowed_through(self):
+        h, sent = self._handler("/admin", cookie=self._good_cookie())
+        h._admin_dispatch("/admin", False)
+        self.assertEqual(sent["code"], 200)
+
+    # ---------------------------------------------------- 第二道关：配了口令
+    def test_disabled_when_no_admin_token_configured(self):
+        """没配口令 = 功能关闭，不是「无口令可进」。"""
+        h, sent = self._handler("/admin", admin_token="")
+        h._admin_dispatch("/admin", False)
+        self.assertEqual(sent["code"], 404)
+        self.assertIn("--admin-token", sent["obj"]["error"])
+
+    def test_disabled_even_with_matching_empty_query(self):
+        h, sent = self._handler("/admin?t=", admin_token="")
+        h._admin_dispatch("/admin", False)
+        self.assertEqual(sent["code"], 404)
+
+    # ---------------------------------------------------- 第三道关：口令
+    def test_no_credentials_prompts_401(self):
+        h, sent = self._handler("/admin")
+        h._admin_dispatch("/admin", False)
+        self.assertEqual(sent["code"], 401)
+        self.assertIn("口令", sent["body"].decode("utf-8"))
+
+    def test_wrong_token_rejected(self):
+        h, sent = self._handler("/admin?t=wrong")
+        h._admin_dispatch("/admin", False)
+        self.assertEqual(sent["code"], 401)
+
+    def test_query_token_sets_cookie_and_redirects(self):
+        h, sent = self._handler("/admin?t=s3cret")
+        h._admin_dispatch("/admin", False)
+        self.assertEqual(sent["code"], 302)
+        self.assertEqual(sent["extra"]["Location"], "/admin")
+        cookie = sent["extra"]["Set-Cookie"]
+        self.assertIn("pg_admin=", cookie)
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("SameSite=Strict", cookie)
+
+    def test_cookie_never_contains_plaintext_token(self):
+        """Cookie 被同步/被日志记录时不该泄露口令。"""
+        h, sent = self._handler("/admin?t=s3cret")
+        h._admin_dispatch("/admin", False)
+        self.assertNotIn("s3cret", sent["extra"]["Set-Cookie"])
+
+    def test_cookie_grants_access(self):
+        h, sent = self._handler("/admin", cookie=self._good_cookie())
+        h._admin_dispatch("/admin", False)
+        self.assertEqual(sent["code"], 200)
+
+    def test_cookie_of_another_token_rejected(self):
+        h, sent = self._handler("/admin", admin_token="s3cret",
+                                cookie=self._good_cookie("other-token"))
+        h._admin_dispatch("/admin", False)
+        self.assertEqual(sent["code"], 401)
+
+    def test_cookie_with_extra_pairs_still_parsed(self):
+        """浏览器会带上其它 Cookie（主页面也种了一个），别被前面的干扰。"""
+        h, sent = self._handler("/admin",
+                                cookie="other=1; " + self._good_cookie() + "; x=2")
+        h._admin_dispatch("/admin", False)
+        self.assertEqual(sent["code"], 200)
+
+    def test_header_token_grants_access(self):
+        h, sent = self._handler("/admin", header="s3cret")
+        h._admin_dispatch("/admin", False)
+        self.assertEqual(sent["code"], 200)
+
+    def test_unknown_admin_path_404(self):
+        """路径白名单：别把 Handler 的私有方法暴露成路由。"""
+        h, sent = self._handler("/admin/../etc/passwd", cookie=self._good_cookie())
+        h._admin_dispatch("/admin/../etc/passwd", False)
+        self.assertEqual(sent["code"], 404)
+
+    def test_admin_api_post_not_reachable_by_get(self):
+        h, sent = self._handler("/admin/api/ddns", cookie=self._good_cookie())
+        h._admin_dispatch("/admin/api/ddns", False)
+        self.assertEqual(sent["code"], 404)
+
+    def test_admin_page_post_not_reachable(self):
+        h, sent = self._handler("/admin", cookie=self._good_cookie(), body={})
+        h._admin_dispatch("/admin", True)
+        self.assertEqual(sent["code"], 404)
+
+    def test_hidden_path_looks_like_404(self):
+        """被拒时的响应要与普通 404 无差别，别泄露「有管理页」。"""
+        public, sent1 = self._handler("/admin?t=s3cret", client="8.8.8.8")
+        public._admin_dispatch("/admin", False)
+        nopath, sent2 = self._handler("/definitely-not-here")
+        nopath._err("未找到", 404)
+        self.assertEqual(sent1["obj"], sent2["obj"])
+
+
+class TestAdminRouting(unittest.TestCase):
+    """admin 必须走**独立口令**，因此在打印鉴权之前分流。"""
+
+    def test_admin_dispatched_before_print_auth_in_get(self):
+        import inspect
+        src = inspect.getsource(pg.Handler.do_GET)
+        # 用 self._authed() 而不是 _authed —— 注释里也提到了这个名字
+        self.assertLess(src.index("_admin_dispatch(path, False)"),
+                        src.index("self._authed()"))
+
+    def test_admin_dispatched_before_print_auth_in_post(self):
+        import inspect
+        src = inspect.getsource(pg.Handler.do_POST)
+        self.assertLess(src.index("_admin_dispatch(path, True)"),
+                        src.index("self._authed()"))
+
+    def test_admin_page_has_expected_controls(self):
+        for marker in ('id="root"', 'id="sub"', 'id="provider"',
+                       'id="bIssue"', 'id="bSync"', 'id="bVerify"',
+                       'id="bSaveCred"', 'id="certLog"'):
+            self.assertIn(marker, pg_admin.ADMIN_PAGE, marker)
+
+    def test_admin_page_posts_to_its_own_apis(self):
+        for route in ("/admin/api/config", "/admin/api/verify",
+                      "/admin/api/ddns", "/admin/api/cert"):
+            self.assertIn(route.split("/api/")[1], pg_admin.ADMIN_PAGE, route)
+
+    def test_healthz_reports_tls(self):
+        import inspect
+        src = inspect.getsource(pg.Handler.do_GET)
+        self.assertIn("tls", src)
+
+
+class TestTlsWiring(unittest.TestCase):
+    """TLS 监听：证书缺失不算致命，但**公网端口免密是硬拒绝**。"""
+
+    def test_main_wires_tls_args(self):
+        import inspect
+        src = inspect.getsource(pg.main)
+        for arg in ("--tls-port", "--tls-cert", "--tls-key", "--tls-bind",
+                    "--admin-token"):
+            self.assertIn(arg, src)
+
+    def test_main_refuses_tls_without_token(self):
+        """启用 TLS 端口却没给口令时，必须拒绝启动而不是「先开着再说」。"""
+        import inspect
+        src = inspect.getsource(pg.main)
+        self.assertIn("必须同时设置 --token", src)
+        idx = src.index("必须同时设置 --token")
+        # 拒绝的那段里得有 return 2（非零退出）
+        self.assertIn("return 2", src[idx: idx + 400])
+
+    def test_missing_cert_is_warning_not_fatal(self):
+        """还没签证书时，内网明文那条路必须照常服务（不能因为没证书就退出）。"""
+        import inspect
+        src = inspect.getsource(pg.main)
+        idx = src.index('LOG.warning("证书缺失')        # 证书判断分支本身
+        end = src.index("server_cls", idx)              # 到「起监听」之间
+        self.assertNotIn("return 2", src[idx:end])
+
+    def test_dualstack_binds_ipv6(self):
+        import socket as _socket
+        self.assertEqual(pg.DualStackServer.address_family, _socket.AF_INET6)
+
+    def test_dualstack_disables_v6only(self):
+        import inspect
+        src = inspect.getsource(pg.DualStackServer.server_bind)
+        self.assertIn("IPV6_V6ONLY", src)
+
+    def test_wrap_tls_sets_minimum_version(self):
+        import inspect
+        src = inspect.getsource(pg.wrap_tls)
+        self.assertIn("TLSv1_2", src)
+        self.assertIn("load_cert_chain", src)
+
+    def test_handler_has_tls_fields(self):
+        self.assertTrue(hasattr(pg.Handler, "tls_enabled"))
+        self.assertTrue(hasattr(pg.Handler, "tls_port"))
+
+
+@unittest.skipUnless(socket.has_ipv6, "本机无 IPv6")
+class TestDualStackSockets(unittest.TestCase):
+    """真起一个双栈监听，确认 IPv4 与 IPv6 都连得上。"""
+
+    def test_ipv4_and_ipv6_both_reach_the_socket(self):
+        try:
+            srv = pg.DualStackServer(("::", 0), pg.Handler)
+        except OSError as exc:
+            self.skipTest("无法绑定 IPv6 通配地址：%s" % exc)
+        self.addCleanup(srv.server_close)
+        port = srv.server_address[1]
+        srv.socket.listen(4)
+        for family, addr in ((socket.AF_INET, "127.0.0.1"),
+                             (socket.AF_INET6, "::1")):
+            try:
+                conn = socket.socket(family, socket.SOCK_STREAM)
+                conn.settimeout(3)
+                conn.connect((addr, port))
+                conn.close()
+            except OSError as exc:
+                self.fail("%s 连不上双栈监听：%s" % (addr, exc))
+
+
+class TestTokenScope(unittest.TestCase):
+    """
+    口令的作用范围：**公网端口强制、内网明文免密**。
+
+    内网免密的合法性完全建立在「8080 不做 DNAT」上，所以这条边界要钉住 ——
+    将来谁把 8080 映射出去，这组测试会提醒他改配置。
+    """
+
+    def _handler(self, token="s3cret", on_tls=False, always=False,
+                 query="", header=None, path="/api/printers"):
+        h = pg.Handler.__new__(pg.Handler)
+        h.path = path + query
+        h.token = token
+        h.token_always = always
+        h.headers = {}
+        if header is not None:
+            h.headers["X-Token"] = header
+        h.server = mock.Mock(is_tls=on_tls)
+        return h
+
+    def test_lan_plaintext_port_is_open_when_token_set(self):
+        """内网明文端口保持免密 —— 否则扫码进来的用户没法用。"""
+        self.assertTrue(self._handler(on_tls=False)._authed())
+
+    def test_public_tls_port_requires_token(self):
+        self.assertFalse(self._handler(on_tls=True)._authed())
+
+    def test_public_tls_port_accepts_query_token(self):
+        self.assertTrue(self._handler(on_tls=True, query="?t=s3cret")._authed())
+
+    def test_public_tls_port_accepts_header_token(self):
+        self.assertTrue(self._handler(on_tls=True, header="s3cret")._authed())
+
+    def test_public_tls_port_rejects_wrong_token(self):
+        self.assertFalse(self._handler(on_tls=True, query="?t=nope")._authed())
+
+    def test_no_token_configured_means_no_checks_anywhere(self):
+        """没配口令时不该因为「少了口令」而拦人（此时公网端口压根起不来）。"""
+        self.assertTrue(self._handler(token="", on_tls=True)._authed())
+
+    def test_token_always_covers_plaintext_port(self):
+        """--token-always：内网也校验（给「8080 也想映射」的人用）。"""
+        self.assertFalse(self._handler(on_tls=False, always=True)._authed())
+        self.assertTrue(self._handler(on_tls=False, always=True,
+                                      query="?t=s3cret")._authed())
+
+    def test_missing_server_attribute_fails_open_for_lan(self):
+        """单元测试/嵌入式调用下没有 server 属性时，按内网处理而不是崩掉。"""
+        h = self._handler()
+        del h.server
+        self.assertTrue(h._authed())
+
+    def test_main_wires_token_scope(self):
+        import inspect
+        src = inspect.getsource(pg.main)
+        self.assertIn("Handler.token_always = bool(args.token_always)", src)
+        self.assertIn("tls_server.is_tls = True", src)
+
+    def test_main_warns_about_plaintext_exposure(self):
+        """免密这件事必须被说出来，否则没人知道它的前提条件。"""
+        import inspect
+        src = inspect.getsource(pg.main)
+        self.assertIn("不做 DNAT", src)
+
+
+class TestPublicUrl(unittest.TestCase):
+    """公网链接只在 TLS 真起来时才给 —— 否则是条打不开的链接，还不如不给。"""
+
+    def _h(self, tls_enabled=True, tls_port=8443, token="abc123"):
+        h = pg.Handler.__new__(pg.Handler)
+        h.tls_enabled = tls_enabled
+        h.tls_port = tls_port
+        h.token = token
+        return h
+
+    def _data(self, root="example.com", sub="print"):
+        d = pg_admin.default_secrets()
+        d["record"] = {"root": root, "sub": sub}
+        return d
+
+    def test_builds_full_url(self):
+        self.assertEqual(self._h()._public_url(self._data()),
+                         "https://print.example.com:8443/?t=abc123")
+
+    def test_omits_port_on_443(self):
+        self.assertEqual(self._h(tls_port=443)._public_url(self._data()),
+                         "https://print.example.com/?t=abc123")
+
+    def test_empty_when_tls_not_running(self):
+        self.assertEqual(self._h(tls_enabled=False)._public_url(self._data()), "")
+
+    def test_empty_without_domain(self):
+        self.assertEqual(self._h()._public_url(self._data(root="", sub="")), "")
+
+    def test_no_token_means_no_query(self):
+        self.assertEqual(self._h(token="")._public_url(self._data()),
+                         "https://print.example.com:8443/")
+
+    def test_status_payload_carries_it(self):
+        import inspect
+        src = inspect.getsource(pg.Handler._admin_action)
+        self.assertIn('status["public_url"]', src)
+
+    def test_copy_helper_is_global_scope(self):
+        """按钮是 innerHTML 重建的，onclick 只能找到全局函数。"""
+        page = pg_admin.ADMIN_PAGE
+        self.assertIn('onclick="copyUrl()"', page)
+        # 顶层定义：出现在 render 之前
+        self.assertLess(page.index("function copyUrl()"),
+                        page.index("function render("))
+
+    def test_page_shows_url_only_when_available(self):
+        self.assertIn("st.public_url", pg_admin.ADMIN_PAGE)
 
 
 if __name__ == "__main__":

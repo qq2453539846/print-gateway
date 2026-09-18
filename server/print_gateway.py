@@ -17,11 +17,19 @@
     GET  /api/printers    打印机列表
     GET  /api/job?id=     按作业号取作业信息（供 App 从「打开方式」直达设置页）
     GET  /healthz         自检
+    GET  /admin           管理页（域名 / 凭据 / 证书；**仅限内网**）
+
+TLS 与公网
+----------
+`--tls-port` 指定时才开 TLS 监听（证书缺失则不监听、只告警）；明文端口与 TLS 端口
+可以并存 —— 内网继续走 8080 明文扫码即用，公网走 8443 TLS。
+**启用 TLS 端口时强制要求 `--token`**：宁可拒绝启动，也不允许出现「公网免密打印」。
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -29,6 +37,8 @@ import re
 import secrets
 import shutil
 import socket
+import socketserver
+import ssl
 import sys
 import threading
 import time
@@ -36,7 +46,9 @@ import urllib.parse
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import pg_admin
 import pg_engine
+import pg_layout
 from pg_engine import EngineError, PrintSpec
 
 LOG = logging.getLogger("print-gateway")
@@ -46,7 +58,7 @@ MAX_UPLOAD_MB = 50
 MAX_FILES = 10
 # 界面版本号（显示在页面右上角）。改动前端时一并递增 ——
 # 用户报「怎么改了没生效」时，第一件事就是看他看到的是哪个版本。
-VERSION = "v3.1 0917"
+VERSION = "v3.6 0918"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".webp"}
 PDF_EXTS = {".pdf"}
 JOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
@@ -56,6 +68,11 @@ HASH_RE = re.compile(r"^[0-9a-f]{16}$")
 _CACHE: dict[tuple[str, str], dict] = {}
 _CACHE_LOCK = threading.Lock()
 _CACHE_LIMIT = 24
+
+# 预览档与出纸档分开缓存/落盘。键上挂个后缀而不是新开一张表 ——
+# 后缀只存在于服务端内部，URL 里的 k 仍是 spec.cache_key()（必须是纯 16 位十六进制，
+# 见 HASH_RE），这样前端和 /img 的一整套约定都不用动。
+_PV = "~pv"
 
 
 class Job:
@@ -202,6 +219,30 @@ def image_to_pdf(src: str, dst: str) -> str:
         raise EngineError("图片转换失败：%s" % exc) from exc
 
 
+# ------------------------------------------------------------------ 小册子示意
+def booklet_summary(pages: int) -> dict:
+    """
+    面板上那枚「小册子缩略示意」需要的最小数据。
+
+    只做配对，不做任何渲染 —— 走的是与实印同一个 pg_layout.booklet_sides()，
+    所以图上的页号不可能和真印出来的结果打架（这是它敢自称「示意」的前提）。
+
+    配对一律按**左装订**算：右装订只是把每面的左右两页对调，前端照着翻一下
+    即可，省得两端各写一份配对公式（这种重复迟早会跑偏）。
+    """
+    if pages <= 0:
+        return {"padded": 0, "sheets": 0, "blank": 0, "faces": []}
+    padded = ((pages + 3) // 4) * 4
+    faces = pg_layout.booklet_sides(pages, "left", "both")[:2]
+    return {
+        "padded": padded,
+        "sheets": padded // 4,
+        "blank": padded - pages,
+        "faces": [{"sheet": f["sheet"], "kind": f["kind"],
+                   "left": f["left"], "right": f["right"]} for f in faces],
+    }
+
+
 # ------------------------------------------------------------------ 页面
 PAGE = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -277,8 +318,23 @@ summary:after{content:"\203A";color:var(--muted);display:inline-block;
 transform:rotate(90deg);font-size:18px;line-height:1}
 details[open] summary:after{transform:rotate(-90deg)}
 details .body{padding-top:10px}
+.bk{display:flex;gap:8px;flex:1}
+.bkbtn{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;
+padding:6px 2px 5px;border:1px solid var(--line);border-radius:8px;background:#fff;
+cursor:pointer;user-select:none;transition:.15s}
+.bkbtn svg{display:block;width:100%;max-width:52px;height:auto}
+.bkbtn span{font-size:12px;color:var(--muted);line-height:1.2}
+.bkbtn.on{border-color:var(--accent);background:var(--accent-soft)}
+.bkbtn.on span{color:var(--accent)}
+.bkbtn:active{transform:scale(.97)}
+.bkthumb{display:flex;align-items:center;gap:12px;flex:1;flex-wrap:wrap}
+.bkthumb svg{display:block;border:1px solid var(--line);border-radius:6px;background:#fff}
+.bksum{font-size:12px;color:var(--muted);line-height:1.7}
+.bksum b{color:var(--text);font-weight:600}
 @media(max-width:820px){.left{flex:1 1 100%}.right{flex:1 1 100%}
 .wrap{padding:12px}.pv{max-height:46vh}}
+@media(max-width:400px){.row>label{flex:0 0 64px;font-size:12px}
+.bk{gap:5px}.bkbtn{padding:5px 1px 4px}.bkbtn span{font-size:11px}}
 </style>
 </head>
 <body>
@@ -377,16 +433,68 @@ details .body{padding-top:10px}
           <div class="row"><label>小册子</label>
             <span class="chk"><input type="checkbox" id="booklet"><label for="booklet">对折装订成册</label></span>
           </div>
-          <div class="row" id="bkRow" style="display:none"><label>装订</label>
-            <select id="bookletBinding">
-              <option value="left">左侧装订</option>
-              <option value="right">右侧装订</option>
-            </select>
-            <select id="bookletSubset">
-              <option value="both">双面</option>
-              <option value="front">仅正面</option>
-              <option value="back">仅背面</option>
-            </select>
+          <!-- 参数仍是 bookletBinding / bookletSubset 两个值，只是换了呈现方式：
+               图标按钮比下拉更容易看懂「哪边装订」「哪些面会印」。 -->
+          <input type="hidden" id="bookletBinding" value="left">
+          <input type="hidden" id="bookletSubset" value="both">
+          <div class="row" id="bkRow" style="display:none"><label>装订方向</label>
+            <div class="bk">
+              <div class="bkbtn" data-for="bookletBinding" data-val="left">
+                <svg width="52" height="34" viewBox="0 0 52 34" aria-hidden="true">
+                  <rect x="2" y="2" width="48" height="30" rx="2.5"
+                        fill="var(--accent-soft)" stroke="var(--accent)"/>
+                  <line x1="26" y1="5" x2="26" y2="29" stroke="#a9b0b8" stroke-dasharray="3 2"/>
+                  <rect x="2" y="2" width="3.5" height="30" rx="1.5" fill="var(--err)"/>
+                </svg>
+                <span>左侧装订</span>
+              </div>
+              <div class="bkbtn" data-for="bookletBinding" data-val="right">
+                <svg width="52" height="34" viewBox="0 0 52 34" aria-hidden="true">
+                  <rect x="2" y="2" width="48" height="30" rx="2.5"
+                        fill="var(--accent-soft)" stroke="var(--accent)"/>
+                  <line x1="26" y1="5" x2="26" y2="29" stroke="#a9b0b8" stroke-dasharray="3 2"/>
+                  <rect x="46.5" y="2" width="3.5" height="30" rx="1.5" fill="var(--err)"/>
+                </svg>
+                <span>右侧装订</span>
+              </div>
+            </div>
+          </div>
+          <div class="row" id="bkRow2" style="display:none"><label>打印面</label>
+            <div class="bk">
+              <div class="bkbtn" data-for="bookletSubset" data-val="both">
+                <svg width="52" height="34" viewBox="0 0 52 34" aria-hidden="true">
+                  <rect x="10" y="2" width="40" height="26" rx="2.5"
+                        fill="var(--accent-soft)" stroke="var(--accent)"/>
+                  <rect x="2" y="7" width="40" height="26" rx="2.5"
+                        fill="var(--accent-soft)" stroke="var(--accent)"/>
+                </svg>
+                <span>双面</span>
+              </div>
+              <div class="bkbtn" data-for="bookletSubset" data-val="front">
+                <svg width="52" height="34" viewBox="0 0 52 34" aria-hidden="true">
+                  <rect x="10" y="2" width="40" height="26" rx="2.5"
+                        fill="none" stroke="#c3c8ce" stroke-dasharray="3 2"/>
+                  <rect x="2" y="7" width="40" height="26" rx="2.5"
+                        fill="var(--accent-soft)" stroke="var(--accent)"/>
+                </svg>
+                <span>仅正面</span>
+              </div>
+              <div class="bkbtn" data-for="bookletSubset" data-val="back">
+                <svg width="52" height="34" viewBox="0 0 52 34" aria-hidden="true">
+                  <rect x="2" y="2" width="40" height="26" rx="2.5"
+                        fill="none" stroke="#c3c8ce" stroke-dasharray="3 2"/>
+                  <rect x="10" y="7" width="40" height="26" rx="2.5"
+                        fill="var(--accent-soft)" stroke="var(--accent)"/>
+                </svg>
+                <span>仅背面</span>
+              </div>
+            </div>
+          </div>
+          <div class="row" id="bkThumbRow" style="display:none"><label>示意</label>
+            <div class="bkthumb">
+              <div id="bkSvg"></div>
+              <div class="bksum" id="bkSum"></div>
+            </div>
           </div>
           <div class="row"><label>双面</label>
             <select id="duplex">
@@ -714,6 +822,7 @@ function afterJob(j){
   $('#hdr').textContent = j.pages + ' 页 · '
     + (j.files > 1 ? j.files + ' 个文件 · ' : '') + '已就绪';
   if (j.pages > 1) $('#pageRange').placeholder = '如 1-3,5（共 ' + j.pages + ' 页）';
+  bkPaint();                       // 上传接口已带回页数与配对，无需等预览
   schedulePreview(0);
 }
 
@@ -730,6 +839,7 @@ function upload(files){
 }
 
 function renderPreview(j){
+  if (j.booklet) JOB.booklet = j.booklet;      // 预览是权威（含页范围后的真实页数）
   $('#pvsub').textContent = j.pages ? ('共 ' + j.pages + ' 张纸') : '';
   var pv = $('#pv');
   if (!j.images || !j.images.length){
@@ -750,6 +860,7 @@ function renderPreview(j){
   if (j.notes && j.notes.length) m += '<br>' + j.notes.map(esc).join('　·　');
   if (j.truncated) m += '<br>仅预览前 ' + j.images.length + ' 张';
   $('#meta').innerHTML = m;
+  bkPaint();
 }
 
 function schedulePreview(delay){
@@ -767,6 +878,108 @@ function runPreview(){
     });
 }
 
+// ---- 小册子图标示意 ---------------------------------------------------
+/**
+ * 页号来自服务端的 booklet 摘要（与实印是同一个 booklet_sides()），
+ * 这里只做两件纯显示的事：右装订把左右对调、按正/背面挑一张。
+ * 配对公式一概不在前端重算 —— 那份重复迟早会和后端跑偏。
+ */
+function bkCell(cx, v){
+  if (v === null || v === undefined)
+    return '<text x="' + cx + '" y="58" text-anchor="middle" font-size="13"'
+      + ' fill="#8a9099">空白</text>';
+  return '<text x="' + cx + '" y="58" text-anchor="middle" font-size="24"'
+    + ' fill="#1f2329">' + v + '</text>';
+}
+
+/**
+ * 小册子的双面档位由几何决定，界面直接锁死它 —— 让用户能选却又不生效，
+ * 比没有这个控件更糟（见 pitfalls 里同类教训）。规则与
+ * pg_engine.PrintSpec.validate() 的归一化必须一致，改一处要同时改两处。
+ * 取消勾选后还原用户原来的选择，别把「短边翻页」留给下一次普通打印。
+ */
+var bkDupSaved = '';
+function bkDuplex(){
+  var on = $('#booklet').checked;
+  var ori = $('#orientation');
+  if (ori) ori.disabled = on;          // 方向对小册子无效：横向是几何前提
+  var sel = $('#duplex');
+  if (!sel) return;
+  if (on){
+    if (!bkDupSaved) bkDupSaved = sel.value;
+    var both = ($('#bookletSubset').value === 'both');
+    sel.value = both ? 'two-sided-short-edge' : 'one-sided';
+    sel.disabled = true;
+    sel.title = both
+      ? '小册子横向对折：折线是竖直的，翻面轴必须与它平行，只能短边翻页'
+      : '只印单面（手动双面）：两次各印一遍，正反面不会互相占位';
+  } else if (bkDupSaved){
+    sel.value = bkDupSaved;
+    sel.disabled = false;
+    sel.title = '';
+    bkDupSaved = '';
+  }
+}
+
+function bkPaint(){
+  bkDuplex();
+  var on = $('#booklet').checked;
+  $('#bkRow').style.display = on ? 'flex' : 'none';
+  $('#bkRow2').style.display = on ? 'flex' : 'none';
+  $('#bkThumbRow').style.display = on ? 'flex' : 'none';
+
+  var binding = $('#bookletBinding').value, subset = $('#bookletSubset').value;
+  [].forEach.call(document.querySelectorAll('.bkbtn'), function(b){
+    b.classList.toggle('on',
+      $('#' + b.getAttribute('data-for')).value === b.getAttribute('data-val'));
+  });
+  if (!on) return;
+
+  var bk = (JOB && JOB.booklet) || null;
+  var box = $('#bkSvg'), sum = $('#bkSum');
+  if (!bk || !bk.faces || !bk.faces.length){
+    box.innerHTML = ''; sum.textContent = '等待页数…'; return;
+  }
+
+  var want = (subset === 'back') ? 'back' : 'front', face = null;
+  bk.faces.forEach(function(f){ if (!face && f.kind === want) face = f; });
+  if (!face) face = bk.faces[0];
+
+  var l = face.left, r = face.right;
+  if (binding === 'right'){ var t = l; l = r; r = t; }
+
+  var bar = (binding === 'right') ? 146 : 3;
+  box.innerHTML =
+    '<svg width="150" height="104" viewBox="0 0 150 104">'
+    + '<rect x="9" y="9" width="61" height="86" rx="4" fill="var(--accent-soft)"'
+    + ' stroke="var(--accent)" stroke-width="0.5"/>'
+    + '<rect x="80" y="9" width="61" height="86" rx="4" fill="var(--accent-soft)"'
+    + ' stroke="var(--accent)" stroke-width="0.5"/>'
+    + '<line x1="75" y1="9" x2="75" y2="95" stroke="#a9b0b8" stroke-dasharray="4 3"/>'
+    + '<rect x="' + bar + '" y="9" width="3" height="86" rx="1.5" fill="var(--err)"/>'
+    + bkCell(39.5, l) + bkCell(110.5, r)
+    + '</svg>';
+
+  var s = '<b>第 ' + face.sheet + ' 张 · '
+    + (face.kind === 'back' ? '背面' : '正面') + '</b><br>'
+    + '共 ' + bk.sheets + ' 张纸 · ' + bk.padded + ' 页';
+  s += '<br>横向对折 · ' + (subset === 'both'
+    ? '双面·短边翻页'
+    : '单面（' + (subset === 'front' ? '仅正面' : '仅背面') + '）');
+  if (bk.blank > 0) s += '<br>末尾补 ' + bk.blank + ' 页空白';
+  sum.innerHTML = s;
+}
+
+function bkPick(group, val){
+  var sel = $('#' + group);
+  if (sel.value !== val){
+    sel.value = val;
+    sel.dispatchEvent(new Event('change'));       // 复用已有的 change 监听
+  } else {
+    bkPaint();
+  }
+}
+
 function syncUI(){
   var bk = $('#booklet').checked;
   var rows = +$('#splitRows').value, cols = +$('#splitCols').value;
@@ -777,8 +990,7 @@ function syncUI(){
   $('#booklet').disabled = sp;
   $('#perSheet').disabled = bk || sp;
   $('#layoutOrder').disabled = bk || sp;
-  $('#bkRow').style.display = bk ? 'flex' : 'none';
-
+  bkPaint();                       // 小册子那几行 + 缩略示意一起刷新
   $('#wmBox').style.display = $('#wmEnabled').checked ? '' : 'none';
   $('#pnBox').style.display = $('#pnEnabled').checked ? '' : 'none';
   $('#hfRow').style.display =
@@ -827,6 +1039,12 @@ function bind(){
       el.addEventListener('input', function(){ syncUI(); schedulePreview(650); });
   });
   $('#refresh').addEventListener('click', runPreview);
+  // 小册子那两组图标按钮：写回隐藏输入框，再走与下拉完全相同的 change 通路
+  [].forEach.call(document.querySelectorAll('.bkbtn'), function(b){
+    b.addEventListener('click', function(){
+      bkPick(b.getAttribute('data-for'), b.getAttribute('data-val'));
+    });
+  });
   $('#go').addEventListener('click', doPrint);
   $('#reset').addEventListener('click', function(){ location.reload(); });
 
@@ -891,10 +1109,18 @@ class Handler(BaseHTTPRequestHandler):
     # --printer 显式指定时置真：此时不再跟随 CUPS 系统默认队列
     printer_locked: bool = False
     token: str = ""
+    # 让明文端口也校验口令（默认否：内网扫码即用是既定体验）
+    token_always: bool = False
     host_display: str = ""
     # 可下载的安卓 App 包（--apk 指定；不存在则 /app 返回 404、healthz 报 app:false）
     apk_path: str = ""
     apk_name: str = "print-selfservice.apk"
+    # 管理页口令。**留空 = 整个 admin 功能关闭**，而不是「无口令可进」——
+    # 一个默认敞开的管理页比没有管理页危险得多。
+    admin_token: str = ""
+    # 供 /admin 页面显示 TLS 现状
+    tls_enabled: bool = False
+    tls_port: int = 0
 
     # -------------------------------------------------------------- 工具
     def log_message(self, fmt, *args):
@@ -967,15 +1193,178 @@ class Handler(BaseHTTPRequestHandler):
             raise EngineError("请求内容不是合法 JSON") from exc
 
     def _authed(self) -> bool:
+        """
+        口令口径：**公网端口（TLS 监听）强制校验，内网明文端口保持免密**。
+
+        之所以不在明文端口上也收口令，是因为「扫码即用」正是内网那条路的全部意义 ——
+        二维码里是固定 URL，带不了口令。内网免密的安全前提是
+        **8080 不做 DNAT**；一旦哪天把 8080 也映射到公网，这里就成了公网免密，
+        所以启动日志会把这件事说出来。要在两个端口上都校验，加 `--token-always`。
+        """
         if not self.token:
+            return True
+        server = getattr(self, "server", None)
+        on_public = bool(getattr(server, "is_tls", False)) or self.token_always
+        if not on_public:
             return True
         q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         given = self.headers.get("X-Token") or (q.get("t") or [""])[0]
         return secrets.compare_digest(given, self.token)
 
+    # ---------------------------------------------------------- 管理页鉴权
+    def _admin_cookie(self) -> str:
+        """
+        Cookie 里放**派生值**而不是口令本身：浏览器同步、历史记录、代理日志
+        都不会因此泄露口令；服务端拿同样的派生值比对即可。
+        """
+        if not self.admin_token:
+            return ""
+        return hashlib.sha256(("pg-admin:" + self.admin_token).encode("utf-8")).hexdigest()[:32]
+
+    def _cookies(self) -> dict:
+        out = {}
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            if "=" in part:
+                key, val = part.split("=", 1)
+                out[key.strip()] = val.strip()
+        return out
+
+    def _admin_authed(self) -> bool:
+        if not self.admin_token:
+            return False
+        given = self.headers.get("X-Admin-Token") or ""
+        if given and secrets.compare_digest(given, self.admin_token):
+            return True
+        got = self._cookies().get("pg_admin", "")
+        return bool(got) and secrets.compare_digest(got, self._admin_cookie())
+
+    def _admin_denied(self):
+        body = ("<!DOCTYPE html><meta charset=utf-8>"
+                "<title>需要口令</title>"
+                "<body style=\"font:15px/1.7 -apple-system,'PingFang SC',sans-serif;"
+                "max-width:520px;margin:80px auto;padding:0 20px;color:#1f2329\">"
+                "<h2 style=\"font-size:17px\">需要管理口令</h2>"
+                "<p style=\"color:#8a9099\">请在地址后附上口令访问一次，"
+                "例如 <code>/admin?t=你的口令</code>，之后会自动记住。</p>"
+                "</body>").encode("utf-8")
+        return self._send(401, body, "text/html; charset=utf-8",
+                          {"Cache-Control": "no-store"})
+
+    # 管理页的动作白名单：只认这几个，避免把 Handler 的私有方法暴露成路由
+    _ADMIN_GETS = ("/admin/api/status",)
+    _ADMIN_POSTS = ("/admin/api/config", "/admin/api/verify",
+                    "/admin/api/ddns", "/admin/api/cert")
+
+    def _admin_dispatch(self, path: str, is_post: bool):
+        """
+        管理页的唯一入口。三道关，顺序不能换：
+
+          1. **只许内网** —— 公网来源一律 404（连「这里有管理页」都不该被知道）
+          2. **必须配了口令** —— 没配就是功能关闭，不是无保护
+          3. **口令校验** —— 支持 `?t=` 引导种 Cookie，或 `X-Admin-Token` 头
+        """
+        if not pg_admin.is_lan_addr(self.client_address[0]):
+            return self._err("未找到", 404)
+        if not self.admin_token:
+            return self._err("未启用管理页（启动时加 --admin-token）", 404)
+
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        given = (query.get("t") or [""])[0]
+        # 引导：带对口令访问一次 → 种 Cookie → 跳回干净 URL。
+        # 跳转是为了让口令不留在地址栏与浏览器历史里。
+        if given and secrets.compare_digest(given, self.admin_token):
+            return self._send(302, b"", "text/plain", {
+                "Set-Cookie": ("pg_admin=%s; Path=/admin; HttpOnly; "
+                               "SameSite=Strict; Max-Age=2592000" % self._admin_cookie()),
+                "Location": "/admin",
+            })
+        if not self._admin_authed():
+            return self._admin_denied()
+
+        allowed = self._ADMIN_POSTS if is_post else self._ADMIN_GETS
+        if path not in allowed and path != "/admin":
+            return self._err("未找到", 404)
+        if path == "/admin":
+            if is_post:
+                return self._err("未找到", 404)
+            body = pg_admin.ADMIN_PAGE.replace("__VERSION__", VERSION).encode("utf-8")
+            return self._send(200, body, "text/html; charset=utf-8",
+                              {"Cache-Control": "no-store, no-cache, must-revalidate"})
+
+        try:
+            return self._admin_action(path, is_post)
+        except EngineError as exc:
+            return self._err(exc)
+        except pg_admin.AdminError as exc:
+            return self._err(exc)
+        except Exception as exc:                                  # noqa: BLE001
+            LOG.exception("管理页 %s 失败", path)
+            return self._err("服务器内部错误：%s" % exc, 500)
+
+    def _public_url(self, data: dict) -> str:
+        """
+        公网访问链接（含口令）。只有在 TLS 端口真的起来了才生成 ——
+        否则给出一个打不开的链接，还不如不给。
+
+        这个值只发给**已通过 admin 鉴权**的会话：用户本来就有权知道自己的口令，
+        但要他手工拼一条 40 字符的 URL 未免太不讲道理。
+        """
+        domain = pg_admin.full_domain(data)
+        if not (domain and self.tls_enabled and self.tls_port):
+            return ""
+        port = "" if self.tls_port == 443 else ":%d" % self.tls_port
+        tail = "?t=%s" % self.token if self.token else ""
+        return "https://%s%s/%s" % (domain, port, tail)
+
+    def _admin_action(self, path: str, is_post: bool):
+        if path == "/admin/api/status":
+            data = pg_admin.load_secrets()
+            status = pg_admin.collect_status(data, self.tls_enabled, self.tls_port)
+            status["public_url"] = self._public_url(data)
+            return self._json(status)
+
+        payload = self._json_body()
+        if path == "/admin/api/config":
+            data = pg_admin.load_secrets()
+            if payload.get("clear_credentials"):
+                pg_admin.clear_credentials(data)
+                pg_admin.save_secrets(data)
+                return self._json({"ok": True, "message": "凭据已清空"})
+            pg_admin.apply_changes(data, payload)
+            pg_admin.save_secrets(data)
+            return self._json({"ok": True,
+                               "message": "已保存（域名 %s）"
+                                          % (pg_admin.full_domain(data) or "未配置")})
+
+        if path == "/admin/api/verify":
+            return self._json(pg_admin.verify_credentials(pg_admin.load_secrets()))
+
+        if path == "/admin/api/ddns":
+            result = pg_admin.sync_ddns(force=bool(payload.get("force")))
+            if result["changed"]:
+                note = "已更新：%s → %s（%s）" % (result["domain"], result["ip"],
+                                              result["action"])
+            else:
+                note = "%s 已是 %s，无需变更" % (result["domain"], result["ip"])
+            result["message"] = note
+            return self._json(result)
+
+        if path == "/admin/api/cert":
+            data = pg_admin.load_secrets()
+            result = pg_admin.issue_cert(data, force=bool(payload.get("force")))
+            pg_admin.save_state({"last_issue": {"at": int(time.time()),
+                                                "ok": result["ok"],
+                                                "message": result["message"]}})
+            return self._json(result)
+
+        return self._err("未找到", 404)
+
     # -------------------------------------------------------------- 路由
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
+        # 管理页走**独立口令**，所以必须在 _authed() 之前分流
+        if path == "/admin" or path.startswith("/admin/"):
+            return self._admin_dispatch(path, False)
         try:
             if path in ("/", "/index.html"):
                 body = (PAGE.replace("__MAXMB__", str(MAX_UPLOAD_MB))
@@ -988,10 +1377,16 @@ class Handler(BaseHTTPRequestHandler):
                                                     "must-revalidate"})
             if path == "/healthz":
                 return self._json({"ok": True, "service": "print-gateway",
-                                   "version": "2.0",
+                                   "version": VERSION,
                                    "printers": len(pg_engine.list_printers()),
                                    "app": bool(self.apk_path and
-                                               os.path.exists(self.apk_path))})
+                                               os.path.exists(self.apk_path)),
+                                   # 公网部署后排查第一步就是看这两项：
+                                   # 8443 到底起没起、管理页开没开
+                                   "tls": {"enabled": self.tls_enabled,
+                                           "port": self.tls_port},
+                                   "auth": bool(self.token),
+                                   "admin": bool(self.admin_token)})
             if path == "/app":
                 # App 包下载：放在鉴权检查之前 —— 手机还没装 App、
                 # 也没有口令，是扫码进来的用户要下载它
@@ -1015,6 +1410,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
+        if path == "/admin" or path.startswith("/admin/"):
+            return self._admin_dispatch(path, True)
         if not self._authed():
             return self._err("未授权", 401)
         try:
@@ -1090,7 +1487,8 @@ class Handler(BaseHTTPRequestHandler):
         LOG.info("上传 %s（%d 个文件，共 %d 页，%d 字节）-> 作业 %s",
                  job.filename, len(items), pages, total_bytes, job.id)
         return self._json({"id": job.id, "filename": job.filename, "pages": pages,
-                           "files": len(items), "size": total_bytes})
+                           "files": len(items), "size": total_bytes,
+                           "booklet": booklet_summary(pages)})
 
     def _printers_payload(self) -> dict:
         """
@@ -1122,21 +1520,36 @@ class Handler(BaseHTTPRequestHandler):
         return spec
 
     def _build(self, job: Job, spec: PrintSpec, with_preview: bool) -> dict:
+        """
+        构建一次作业，返回可直接用于响应/出纸的条目。
+
+        预览与出纸**分开构建**，因为两者要的分辨率根本不同：
+
+        - 预览只要看清版面，最终图就是 72dpi 的 → 按 PREVIEW_BUILD_DPI 构建，
+          实测 10 页小册子 20.1s → 6.3s（版面完全一致，见 build_final 的说明）；
+        - 出纸必须按 spec.dpi 构建，拿预览档去印会糊。
+
+        所以两条路径各有各的缓存槽与工作目录（`build-<key>` / `build-<key>~pv`），
+        互不覆盖。代价是「先预览再打印」时那次出纸档构建躲不掉 —— 但那本来就是
+        必须付的成本，只是从预览时刻挪到了打印时刻。
+        """
         key = spec.cache_key()
-        cached = _CACHE.get((job.id, key))
+        slot = key + _PV if with_preview else key
+        cached = _CACHE.get((job.id, slot))
         if cached and os.path.exists(cached["pdf"]) and \
                 (not with_preview or cached.get("images")):
             return cached
 
-        work = self.store.workdir_for(job, key)
-        res = pg_engine.build_final(spec, job.source_pdf, work)
+        work = self.store.workdir_for(job, slot)
+        res = pg_engine.build_final(spec, job.source_pdf, work,
+                                    preview=with_preview)
         entry = {"pdf": res["pdf"], "mode": res["mode"], "pages": res["pages"],
                  "source_pages": res["source_pages"], "sheet": res["sheet"],
                  "notes": res["notes"], "images": []}
         if with_preview:
             entry["images"] = pg_engine.make_preview(res["pdf"], work)
         with _CACHE_LOCK:
-            _CACHE[(job.id, key)] = entry
+            _CACHE[(job.id, slot)] = entry
             while len(_CACHE) > _CACHE_LIMIT:
                 _CACHE.pop(next(iter(_CACHE)))
         return entry
@@ -1174,6 +1587,7 @@ class Handler(BaseHTTPRequestHandler):
             "mode": entry["mode"], "pages": entry["pages"],
             "source_pages": entry["source_pages"], "sheet": list(entry["sheet"]),
             "notes": entry["notes"],
+            "booklet": booklet_summary(entry["source_pages"]),
             "images": self._preview_urls(job, spec.cache_key(), entry),
             "truncated": entry["pages"] > len(entry["images"]),
         })
@@ -1203,14 +1617,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._err("无效的页码", 404)
 
         path = None
-        entry = _CACHE.get((job.id, key))
-        for p in (entry or {}).get("images", []):
-            if re.search(r"[-/]0*%d\.png$" % n, p):
-                path = p
+        # 预览图既可能在预览档槽位（常见），也可能在出纸档槽位（旧版行为）；
+        # 缓存被挤掉时退回磁盘上的两个构建目录找 —— URL 里的 k 保持不变。
+        for slot in (key + _PV, key):
+            entry = _CACHE.get((job.id, slot))
+            for p in (entry or {}).get("images", []):
+                if re.search(r"[-/]0*%d\.png$" % n, p):
+                    path = p
+                    break
+            if path:
                 break
         if not path:
-            cand = os.path.join(job.dir, "build-" + key, "preview-%d.png" % n)
-            path = cand if os.path.exists(cand) else None
+            for slot in (key + _PV, key):
+                cand = os.path.join(job.dir, "build-" + slot, "preview-%d.png" % n)
+                if os.path.exists(cand):
+                    path = cand
+                    break
         if not path or not os.path.exists(path):
             return self._err("预览图不存在", 404)
         # 只允许读取本作业目录下的文件
@@ -1225,6 +1647,57 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(200, data, "image/png", {"Cache-Control": "private, max-age=300"})
 
 
+class DualStackServer(ThreadingHTTPServer):
+    """
+    双栈监听：同一端口同时接受 IPv4 与 IPv6。
+
+    为什么要显式设 `IPV6_V6ONLY=0`：Linux 的默认值虽是 0，但发行版/内核参数
+    （`net.ipv6.bindv6only`）会改它。一旦是 1，绑 `::` 就**只听得懂 IPv6**，
+    而用户的 DNAT 是 IPv4 —— 表现为「映射配好了、外面死活连不上」，
+    排查起来极其费时。显式关掉，两头都收。
+    """
+
+    address_family = socket.AF_INET6
+    daemon_threads = True
+
+    def server_bind(self):
+        try:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        except (AttributeError, OSError) as exc:
+            LOG.warning("无法关闭 IPV6_V6ONLY（%s）—— IPv4 可能收不到", exc)
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        # 跳过标准库的 getfqdn：对 "::" 会触发一次 DNS 查询，白等几秒
+        self.server_name = host or "::"
+        self.server_port = port
+
+    def handle_error(self, request, client_address):
+        # TLS 端口常年被扫描器敲门，握手失败是常态，别刷栈
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ssl.SSLError, ConnectionResetError, BrokenPipeError)):
+            LOG.debug("TLS 连接异常（%s）：%s", client_address[0], exc)
+            return
+        super().handle_error(request, client_address)
+
+
+def wrap_tls(httpd: ThreadingHTTPServer, cert: str, key: str) -> None:
+    """
+    给**监听套接字**套 TLS：之后 accept 出来的连接在建立时即完成握手。
+
+    只支持 TLS 1.2+（微信 WebView 与所有现代浏览器都没问题，老 Android 4.x 不行）。
+    """
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    try:
+        # 只宣告 http/1.1：本网关不会说 HTTP/2，宣告了反而让部分客户端
+        # 协商到我们答不上来的协议
+        ctx.set_alpn_protocols(["http/1.1"])
+    except NotImplementedError:
+        pass
+    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     global MAX_UPLOAD_MB
 
@@ -1233,7 +1706,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--bind", default="0.0.0.0")
     ap.add_argument("--printer", default="",
                     help="锁定默认打印队列；留空则跟随 CUPS 系统默认打印机")
-    ap.add_argument("--token", default="", help="可选访问口令，留空则免密")
+    ap.add_argument("--token", default="", help="公网端口(TLS)的访问口令")
+    ap.add_argument("--token-always", action="store_true",
+                    help="明文端口也校验口令（默认内网免密，扫码即用）")
     ap.add_argument("--spool", default="/var/spool/print-gateway")
     ap.add_argument("--title", default="扫码打印")
     ap.add_argument("--default-dpi", type=int, default=pg_engine.DEFAULT_DPI)
@@ -1243,6 +1718,16 @@ def main(argv: list[str] | None = None) -> int:
                     help="界面上展示的访问地址，留空自动探测")
     ap.add_argument("--apk", default="",
                     help="安卓 App 包路径；配置后 GET /app 下载，未配置则 /app 404")
+    ap.add_argument("--admin-token", default="",
+                    help="管理页口令；留空则整个 /admin 关闭（不会免密开放）")
+    ap.add_argument("--tls-port", type=int, default=0,
+                    help="TLS 监听端口（如 8443）；0 = 不开。需 --token 与有效证书")
+    ap.add_argument("--tls-bind", default="::",
+                    help="TLS 监听地址，默认 :: 双栈（IPv4/IPv6 都收）")
+    ap.add_argument("--tls-cert", default="",
+                    help="证书链路径，默认 %s" % pg_admin.cert_paths()["crt"])
+    ap.add_argument("--tls-key", default="",
+                    help="私钥路径，默认 %s" % pg_admin.cert_paths()["key"])
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -1268,6 +1753,7 @@ def main(argv: list[str] | None = None) -> int:
     # 显式 --printer 视为锁定：不再跟随 CUPS 默认。
     Handler.printer_locked = bool(args.printer)
     Handler.token = args.token
+    Handler.token_always = bool(args.token_always)
     pg_engine.DEFAULT_DPI = args.default_dpi
 
     # 安卓 App 包下载端点。缺失只告警不致命 —— 网关本身可继续服务，
@@ -1277,6 +1763,11 @@ def main(argv: list[str] | None = None) -> int:
         Handler.apk_name = os.path.basename(args.apk)
         if not os.path.exists(args.apk):
             LOG.warning("--apk 指向的文件不存在：%s（/app 将返回 404）", args.apk)
+
+    Handler.admin_token = args.admin_token
+    if not args.admin_token:
+        LOG.warning("未设置 --admin-token：/admin 已关闭"
+                    "（本网关不提供「无口令的管理页」）")
 
     printers = pg_engine.list_printers()
     names = [p["name"] for p in printers]
@@ -1305,6 +1796,47 @@ def main(argv: list[str] | None = None) -> int:
     LOG.info("%s 已启动：http://%s:%d", args.title, host, args.port)
     LOG.info("上传上限 %d MB，预览 %d dpi，默认打印 %d dpi",
              MAX_UPLOAD_MB, pg_engine.PREVIEW_DPI, pg_engine.DEFAULT_DPI)
+    if args.token and not args.token_always:
+        # 这句话必须说出来：免密的合法性完全建立在「8080 不做 DNAT」上，
+        # 哪天有人把它映射出去，这里就变成了公网免密
+        LOG.warning("明文端口 %d 免密（内网扫码即用）—— "
+                    "前提是它**不做 DNAT**；映射到公网即等于公网免密",
+                    args.port)
+
+    # ---------------------------------------------------------- TLS 监听
+    # 证书缺失**只告警不退出**：内网明文那条路照常工作，不能因为「还没签证书」
+    # 就把用户现有的打印服务弄挂。
+    tls_server = None
+    if args.tls_port:
+        if not args.token:
+            # 硬拒绝：公网端口免密等于把打印机敞开给全网
+            LOG.error("启用 --tls-port 时必须同时设置 --token"
+                      "（公网端口不允许免密）")
+            return 2
+        cert = args.tls_cert or pg_admin.cert_paths()["crt"]
+        key = args.tls_key or pg_admin.cert_paths()["key"]
+        if not (os.path.isfile(cert) and os.path.isfile(key)):
+            LOG.warning("证书缺失（%s）—— %d 端口未启用；先在 /admin 里签发",
+                        cert, args.tls_port)
+        else:
+            server_cls = (DualStackServer if ":" in args.tls_bind
+                          else ThreadingHTTPServer)
+            try:
+                tls_server = server_cls((args.tls_bind, args.tls_port), Handler)
+                tls_server.request_queue_size = 64
+                tls_server.daemon_threads = True
+                # 标记：Handler 靠它判断「这是公网端口，必须校验口令」
+                tls_server.is_tls = True
+                wrap_tls(tls_server, cert, key)
+            except (OSError, ssl.SSLError) as exc:
+                LOG.error("TLS 端口 %d 启动失败：%s", args.tls_port, exc)
+                return 2
+            Handler.tls_enabled = True
+            Handler.tls_port = args.tls_port
+            LOG.info("HTTPS 已启用：https://%s:%d（证书 %s）",
+                     args.tls_bind, args.tls_port, cert)
+    if args.admin_token:
+        LOG.info("管理页：http://%s:%d/admin （仅限内网）", host, args.port)
 
     def reaper():
         while True:
@@ -1315,12 +1847,21 @@ def main(argv: list[str] | None = None) -> int:
                 LOG.exception("清理作业时出错")
 
     threading.Thread(target=reaper, daemon=True).start()
+
+    # 明文端口跑在主线程（它是「必须活着」的那个），TLS 端口在守护线程里
+    extra = [srv for srv in (tls_server,) if srv is not None]
+    for srv in extra:
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         LOG.info("收到中断，退出")
     finally:
-        httpd.server_close()
+        for srv in [httpd] + extra:
+            try:
+                srv.server_close()
+            except OSError:
+                pass
     return 0
 
 

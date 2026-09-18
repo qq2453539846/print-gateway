@@ -314,8 +314,12 @@ def build_plan(spec: dict, page_sizes: list[tuple[float, float]], page_count: in
 
     orientation = spec.get("orientation", "auto")
     if booklet:
-        rotate_sheet = True                                  # 小册子固定横向对折
-    if orientation == "landscape":
+        # 小册子必须横向对折，页面方向对它无效 —— 这里曾经是两个彼此独立的
+        # if，于是用户选「纵向」会把 booklet 的强制横向**悄悄推翻**：纸变成竖的，
+        # 两版各只剩半张宽（A4 竖纸每版 298 点），整本缩到 50% 且中线仍在正中，
+        # 印出来「能看但不对」。现在 booklet 优先，方向只在非小册子时起作用。
+        rotate_sheet = True
+    elif orientation == "landscape":
         rotate_sheet = True
     elif orientation == "portrait":
         rotate_sheet = False

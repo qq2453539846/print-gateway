@@ -5,6 +5,11 @@ pipeline 本身（gs / pdftoppm / lp）在设备上做端到端验证，这里�
 用 mock 顶掉 subprocess，保证本地可跑、可回归。
 """
 
+import os
+import shutil
+import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -648,6 +653,501 @@ class TestStretchMode(unittest.TestCase):
             self.assertAlmostEqual(pl["w"], 595.28 / 2, places=1)
             self.assertAlmostEqual(pl["h"], 841.89 / 2, places=1)
 
+
+
+class TestPreviewChunks(unittest.TestCase):
+    """预览分片：必须连续、不重叠、全覆盖，页数少时退回单进程。"""
+
+    def test_zero_pages(self):
+        self.assertEqual(pg._preview_chunks(0), [])
+
+    def test_single_page_is_one_chunk(self):
+        self.assertEqual(pg._preview_chunks(1), [(1, 1)])
+
+    def test_too_few_pages_not_split(self):
+        """limit // min_pages == 1 —— 分片后每片不足 2 页，启动开销盖过收益。"""
+        self.assertEqual(pg._preview_chunks(3), [(1, 3)])
+
+    def test_four_pages_two_chunks(self):
+        self.assertEqual(pg._preview_chunks(4), [(1, 2), (3, 4)])
+
+    def test_six_pages_three_chunks(self):
+        self.assertEqual(pg._preview_chunks(6), [(1, 2), (3, 4), (5, 6)])
+
+    def test_ten_pages_balanced(self):
+        self.assertEqual(pg._preview_chunks(10), [(1, 4), (5, 7), (8, 10)])
+
+    def test_never_exceeds_workers(self):
+        for limit in (1, 2, 4, 10, 40, 200):
+            self.assertLessEqual(len(pg._preview_chunks(limit)), pg.PREVIEW_WORKERS,
+                                 "limit=%d" % limit)
+
+    def test_spans_are_contiguous_and_complete(self):
+        for limit in range(1, 60):
+            pages = [p for a, b in pg._preview_chunks(limit) for p in range(a, b + 1)]
+            self.assertEqual(pages, list(range(1, limit + 1)), "limit=%d" % limit)
+
+    def test_workers_one_means_single_chunk(self):
+        self.assertEqual(pg._preview_chunks(40, workers=1), [(1, 40)])
+
+    def test_leaves_a_core_free(self):
+        """板子是 4 核，预览故意只用 3 个 worker，留 1 核给服务与系统任务。"""
+        self.assertEqual(pg.PREVIEW_WORKERS, 3)
+        self.assertLess(pg.PREVIEW_WORKERS, 4)
+
+
+PDFINFO_SAMPLE = """Pages:           {n}
+Page size:       595.276 x 841.89 pts (A4)
+"""
+
+
+class TestMakePreview(unittest.TestCase):
+    """预览渲染：分片命令、结果合并顺序、失败传播、回退单进程。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="pgprev_")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def _fake(self, calls, total=10, fail_span=None, touch=True):
+        """顶掉 subprocess：pdfinfo 返回页数，pdftoppm 按源页号落文件。"""
+        def fake(cmd, timeout=300, cwd=None):
+            if cmd[0] == pg.PDFINFO:
+                return (0, PDFINFO_SAMPLE.format(n=total))
+            calls.append(cmd)
+            first = int(cmd[cmd.index("-f") + 1])
+            last = int(cmd[cmd.index("-l") + 1])
+            if fail_span == (first, last):
+                return (1, "syntax error")
+            if touch:
+                for p in range(first, last + 1):
+                    open(os.path.join(self.dir, "preview-%02d.png" % p), "wb").close()
+            return (0, "")
+        return fake
+
+    def _spans(self, calls):
+        return [(int(c[c.index("-f") + 1]), int(c[c.index("-l") + 1])) for c in calls]
+
+    def test_splits_into_three_calls(self):
+        calls = []
+        with mock.patch.object(pg, "run", side_effect=self._fake(calls)):
+            files = pg.make_preview("x.pdf", self.dir)
+        self.assertEqual(self._spans(calls), [(1, 4), (5, 7), (8, 10)])
+        self.assertEqual(len(files), 10)
+
+    def test_returns_pages_in_ascending_order(self):
+        calls = []
+        with mock.patch.object(pg, "run", side_effect=self._fake(calls)):
+            files = pg.make_preview("x.pdf", self.dir)
+        nums = [int(os.path.basename(p).split("-")[1].split(".")[0]) for p in files]
+        self.assertEqual(nums, list(range(1, 11)))
+
+    def test_chunk_args_cover_every_page_once(self):
+        calls = []
+        with mock.patch.object(pg, "run", side_effect=self._fake(calls, total=40)):
+            pg.make_preview("x.pdf", self.dir)
+        pages = [p for a, b in self._spans(calls) for p in range(a, b + 1)]
+        self.assertEqual(pages, list(range(1, 41)))
+
+    def test_always_png_and_requested_dpi(self):
+        calls = []
+        with mock.patch.object(pg, "run", side_effect=self._fake(calls)):
+            pg.make_preview("x.pdf", self.dir, dpi=150)
+        for c in calls:
+            self.assertIn("-png", c)
+            self.assertEqual(c[c.index("-r") + 1], "150")
+            self.assertEqual(c[-2], "x.pdf")                 # 源 PDF 之后只剩输出前缀
+
+    def test_small_document_single_process(self):
+        calls = []
+        with mock.patch.object(pg, "run", side_effect=self._fake(calls, total=3)):
+            files = pg.make_preview("x.pdf", self.dir)
+        self.assertEqual(self._spans(calls), [(1, 3)])
+        self.assertEqual(len(files), 3)
+
+    def test_workers_one_disables_parallel(self):
+        calls = []
+        with mock.patch.object(pg, "run", side_effect=self._fake(calls, total=40)):
+            pg.make_preview("x.pdf", self.dir, workers=1)
+        self.assertEqual(len(calls), 1)
+
+    def test_max_pages_caps_limit(self):
+        calls = []
+        with mock.patch.object(pg, "run", side_effect=self._fake(calls, total=100)):
+            files = pg.make_preview("x.pdf", self.dir, max_pages=40)
+        self.assertEqual(max(b for _, b in self._spans(calls)), 40)
+        self.assertEqual(len(files), 40)
+
+    def test_zero_page_pdf_returns_empty(self):
+        calls = []
+        with mock.patch.object(pg, "run", side_effect=self._fake(calls, total=0)):
+            self.assertEqual(pg.make_preview("x.pdf", self.dir), [])
+        self.assertEqual(calls, [])
+
+    def test_failure_raises_engine_error(self):
+        calls = []
+        with mock.patch.object(pg, "run",
+                               side_effect=self._fake(calls, fail_span=(5, 7))):
+            with self.assertRaises(pg.EngineError) as ctx:
+                pg.make_preview("x.pdf", self.dir)
+        self.assertIn("第 5-7 页", str(ctx.exception))
+
+    def test_no_partial_silence_on_failure(self):
+        """任一片失败都必须报错，不能悄悄返回偏少的页数。"""
+        calls = []
+        with mock.patch.object(pg, "run",
+                               side_effect=self._fake(calls, fail_span=(1, 4))):
+            with self.assertRaises(pg.EngineError):
+                pg.make_preview("x.pdf", self.dir)
+
+    def test_global_gate_caps_concurrent_requests(self):
+        """两个人同时点预览：同时在跑的 pdftoppm 也不得超过 PREVIEW_WORKERS。
+
+        防的是「N 个请求 x 3 片」把 4 核压满 —— 那会让 HTTP 服务本身与
+        SSH 都发涩，正是要留一个核的原因。
+        """
+        lock = threading.Lock()
+        state = {"live": 0, "peak": 0}
+
+        def fake(cmd, timeout=300, cwd=None):
+            if cmd[0] == pg.PDFINFO:
+                return (0, PDFINFO_SAMPLE.format(n=10))
+            with lock:
+                state["live"] += 1
+                state["peak"] = max(state["peak"], state["live"])
+            try:
+                time.sleep(0.05)                     # 撑开窗口，制造真重叠
+                first = int(cmd[cmd.index("-f") + 1])
+                last = int(cmd[cmd.index("-l") + 1])
+                for p in range(first, last + 1):
+                    open(os.path.join(self.dir, "preview-%02d.png" % p), "wb").close()
+            finally:
+                with lock:
+                    state["live"] -= 1
+            return (0, "")
+
+        dirs = [tempfile.mkdtemp(prefix="pgprev_gate%d_" % i) for i in range(2)]
+        for d in dirs:
+            self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        errors = []
+
+        def worker(work):
+            try:
+                pg.make_preview("x.pdf", work)
+            except Exception as exc:                 # noqa: BLE001
+                errors.append(exc)
+
+        with mock.patch.object(pg, "run", side_effect=fake):
+            threads = [threading.Thread(target=worker, args=(d,)) for d in dirs]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=15)
+
+        self.assertEqual(errors, [])
+        self.assertLessEqual(state["peak"], pg.PREVIEW_WORKERS)
+        self.assertGreaterEqual(state["peak"], 2)    # 确认真的并发了，不是串行假象
+
+
+class TestPreviewBuildDpi(unittest.TestCase):
+    """
+    预览档构建：按 PREVIEW_BUILD_DPI 拼，但版面与报出来的分辨率仍是出纸档的。
+
+    这条不变量是「预览可以用低分辨率构建」的**全部依据** —— 一旦破了，
+    用户看到的版面和印出来的就不是一回事了。
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="pgpvdpi_")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.imposed = []
+
+    def _patch(self):
+        """顶掉 gs 与 poppler：只留 build_final 自己的决策逻辑。"""
+        def fake_run(cmd, timeout=300, cwd=None):
+            if cmd[0] == pg.PDFINFO:
+                return (0, PDFINFO_SAMPLE.format(n=10))
+            return (0, "")                       # gs_normalize / select_pages
+
+        def fake_gs(src, out, **kw):
+            open(out, "wb").close()
+            return out
+
+        def fake_impose(src, out, plan, dpi, *a, **kw):
+            self.imposed.append(dpi)
+            open(out, "wb").close()
+            # 照实返回真实 impose 会给出的 render_dpi（它来自 render_jobs(plan, dpi)），
+            # 否则「报出来的分辨率」这条就验不到真东西
+            return {"render_dpi": [j["dpi"] for j in pg_layout.render_jobs(plan, dpi)],
+                    "images": 0, "tiles": 0}
+
+        return [
+            mock.patch.object(pg, "run", side_effect=fake_run),
+            mock.patch.object(pg, "gs_normalize", side_effect=fake_gs),
+            mock.patch.object(pg, "impose", side_effect=fake_impose),
+        ]
+
+    def _build(self, preview, dpi=300, booklet=True):
+        spec = pg.PrintSpec.from_form({"paper": "A4", "scale_mode": "fit",
+                                       "dpi": dpi, "booklet": booklet})
+        spec.validate()
+        patchers = self._patch()
+        for p in patchers:
+            p.start()
+            self.addCleanup(p.stop)
+        return pg.build_final(spec, "src.pdf", self.dir, preview=preview)
+
+    def test_preview_build_uses_preview_dpi(self):
+        self._build(preview=True)
+        self.assertEqual(self.imposed, [pg.PREVIEW_BUILD_DPI])
+
+    def test_print_build_uses_spec_dpi(self):
+        self._build(preview=False, dpi=300)
+        self.assertEqual(self.imposed, [300])
+
+    def test_preview_build_dpi_is_below_print_dpi(self):
+        """预览档必须真的更省 —— 否则这个开关没有任何意义。"""
+        self.assertLess(pg.PREVIEW_BUILD_DPI, pg.DEFAULT_DPI)
+
+    def test_preview_note_reports_print_dpi(self):
+        """面板上「单页渲染分辨率」不能因为走了预览档就缩水 —— 那是印出来的数。"""
+        hi = self._build(preview=False, dpi=300)
+        lo = self._build(preview=True, dpi=300)
+        note = [n for n in hi["notes"] if "渲染分辨率" in n]
+        self.assertTrue(note, "出纸档应当给出渲染分辨率说明")
+        self.assertEqual(note, [n for n in lo["notes"] if "渲染分辨率" in n])
+
+    def test_preview_build_leaves_layout_untouched(self):
+        """版面（placement 的点坐标）只由设置与源页尺寸决定，与 dpi 无关。"""
+        hi = self._build(preview=False, dpi=300)
+        lo = self._build(preview=True, dpi=300)
+
+        def strip(plan):
+            return [(f["kind"], f["sheet"],
+                     [(p["key"], p["page"], round(p["x"], 6), round(p["y"], 6),
+                       round(p["w"], 6), round(p["h"], 6), p["rotate"])
+                      for p in f["placements"]])
+                    for f in plan["faces"]]
+
+        self.assertEqual(strip(hi["plan"]), strip(lo["plan"]))
+        self.assertEqual(hi["sheet"], lo["sheet"])
+        self.assertEqual(hi["pages"], lo["pages"])
+
+    def test_dpi_only_changes_pixel_boxes_not_geometry(self):
+        """
+        render_jobs 里随 dpi 变的**只有像素块大小**：job 的数量、身份、
+        以及 placement 的点坐标都恒等。这条是「预览可以换 dpi 构建」的依据。
+        """
+        sizes = [(595.276, 841.89)] * 10
+        plan = pg_layout.build_plan({"paper": "A4", "scale_mode": "fit",
+                                     "booklet": True, "per_sheet": 1}, sizes, 10)
+        hi = pg_layout.render_jobs(plan, pg.DEFAULT_DPI)
+        lo = pg_layout.render_jobs(plan, pg.PREVIEW_BUILD_DPI)
+
+        self.assertEqual([j["key"] for j in hi], [j["key"] for j in lo])
+        self.assertEqual([j["page"] for j in hi], [j["page"] for j in lo])
+        self.assertTrue(hi and lo)
+
+        # 像素块按 dpi 成比例缩小；compose 用的是 plan 里的点坐标，
+        # 所以贴到纸上的位置与大小不受影响。
+        for a, b in zip(hi, lo):
+            ratio = b["dpi"] / float(a["dpi"])
+            self.assertAlmostEqual(b["region"][2], round(a["region"][2] * ratio), delta=2)
+
+        hi_pts = [(p["x"], p["y"], p["w"], p["h"])
+                  for f in plan["faces"] for p in f["placements"]]
+        lo_pts = [(p["x"], p["y"], p["w"], p["h"])
+                  for f in plan["faces"] for p in f["placements"]]
+        self.assertEqual(hi_pts, lo_pts)
+
+    def test_preview_build_really_saves_pixels(self):
+        """反过来钉住收益：源页像素数确实按 dpi 缩了，省的是真像素。"""
+        sizes = [(595.276, 841.89)] * 10
+        plan = pg_layout.build_plan({"paper": "A4", "scale_mode": "fit",
+                                     "booklet": True, "per_sheet": 1}, sizes, 10)
+
+        def px(dpi):
+            return sum(j["region"][2] * j["region"][3]
+                       for j in pg_layout.render_jobs(plan, dpi))
+
+        self.assertLess(px(pg.PREVIEW_BUILD_DPI), px(pg.DEFAULT_DPI) / 3.0)
+
+
+class TestBookletPaperAndDuplex(unittest.TestCase):
+    """
+    小册子的**纸型方向**与**双面档位**都是几何决定的，不接受用户选择。
+
+    两条都是 2026-09-18 查出来的真 BUG：
+
+      * 双面档位：判据是「**翻面轴必须与折线平行**」。小册子被强制横向，折线是
+        竖直中线，所以要绕竖直轴翻 = 绕短边（210mm）翻 = 短边翻页。若用长边
+        翻页，打印机把背面左格放到物理左半张上，**纸页配对被整体错开半张** ——
+        8 页册子的封面纸会变成「正面 1 · 背面 7」，装订出来页码全乱。
+      * 纸型方向：build_plan 里 booklet 与 orientation 曾是两个彼此独立的 if，
+        用户选「纵向」会把强制横向**悄悄推翻**：A4 竖纸放两版，每版只剩 298 点
+        宽，整本缩到 50%，而中线还在正中 —— 印出来「能看但不对」。
+    """
+
+    SIZES = [(595.276, 841.89)] * 12
+
+    def _plan(self, **over):
+        spec = pg.PrintSpec(booklet=True, **over)
+        spec.validate()
+        return spec, pg_layout.build_plan(spec.layout_dict(), self.SIZES, 12)
+
+    def test_duplex_untouched_without_booklet(self):
+        """非小册子时原样放行 —— 别把这条修成「谁都别想用长边」。"""
+        for d in ("one-sided", "two-sided-long-edge", "two-sided-short-edge"):
+            spec = pg.PrintSpec(duplex=d)
+            spec.validate()
+            self.assertEqual(spec.duplex, d)
+
+    def test_booklet_forces_short_edge(self):
+        """横向纸对折只能配短边翻页；用户选什么双面档位都作废。"""
+        for d in ("one-sided", "two-sided-long-edge", "two-sided-short-edge"):
+            spec, _ = self._plan(duplex=d)
+            self.assertEqual(spec.duplex, "two-sided-short-edge", d)
+
+    def test_booklet_single_side_subset_forces_one_sided(self):
+        """只印正面/背面 = 手动双面，两次都得单面，否则正反面互相占位。"""
+        for subset in ("front", "back"):
+            for d in ("one-sided", "two-sided-long-edge", "two-sided-short-edge"):
+                spec, _ = self._plan(booklet_subset=subset, duplex=d)
+                self.assertEqual(spec.duplex, "one-sided", "%s/%s" % (subset, d))
+
+    def test_lp_command_carries_forced_sides(self):
+        """真正送出去的 sides 必须是短边 —— 只改 spec 不落到命令行等于没改。"""
+        captured = {}
+
+        def fake(cmd, timeout=120, cwd=None):
+            captured["cmd"] = cmd
+            return 0, "request id is GW_TEST-7 (1 file(s))"
+
+        spec = pg.PrintSpec(printer="GW_TEST", booklet=True,
+                            duplex="two-sided-long-edge")
+        spec.validate()
+        with mock.patch.object(pg, "run", side_effect=fake):
+            pg.send_to_printer("/tmp/x.pdf", spec, "册子")
+        self.assertIn("sides=two-sided-short-edge", " ".join(captured["cmd"]))
+
+    def test_booklet_ignores_portrait_orientation(self):
+        """小册子必须横向：方向选择不能把它推翻，两版各占半张宽。"""
+        for ori in ("auto", "portrait", "landscape"):
+            _, plan = self._plan(orientation=ori)
+            self.assertGreater(plan["sheet_w"], plan["sheet_h"], ori)
+            self.assertAlmostEqual(plan["cell_w"], plan["sheet_w"] / 2.0, places=6)
+            self.assertEqual(len({p["cell"][0] for f in plan["faces"]
+                                  for p in f["placements"]}), 2)
+
+    def test_orientation_still_applies_without_booklet(self):
+        """非小册子时方向照旧生效。"""
+        sizes = [(595.276, 841.89)] * 4
+        for ori, want_landscape in (("portrait", False), ("landscape", True)):
+            spec = pg.PrintSpec(orientation=ori, per_sheet=2)
+            spec.validate()
+            plan = pg_layout.build_plan(spec.layout_dict(), sizes, 4)
+            self.assertEqual(plan["sheet_w"] > plan["sheet_h"], want_landscape, ori)
+
+    def test_notes_tell_the_user_duplex_was_changed(self):
+        """用户选了长边却被改成短边，必须在 notes 里说出来，不能静默改。"""
+        d = tempfile.mkdtemp(prefix="pgbknote_")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+
+        def fake_run(cmd, timeout=300, cwd=None):
+            if cmd[0] == pg.PDFINFO:
+                return (0, PDFINFO_SAMPLE.format(n=8))
+            return (0, "")
+
+        def fake_gs(src, out, **kw):
+            open(out, "wb").close()
+            return out
+
+        def fake_impose(src, out, plan, dpi, *a, **kw):
+            open(out, "wb").close()
+            return {"render_dpi": [j["dpi"] for j in pg_layout.render_jobs(plan, dpi)],
+                    "images": 0, "tiles": 0}
+
+        spec = pg.PrintSpec.from_form({"paper": "A4", "scale_mode": "fit",
+                                       "booklet": True,
+                                       "duplex": "two-sided-long-edge"})
+        spec.validate()
+        with mock.patch.object(pg, "run", side_effect=fake_run), \
+                mock.patch.object(pg, "gs_normalize", side_effect=fake_gs), \
+                mock.patch.object(pg, "impose", side_effect=fake_impose):
+            res = pg.build_final(spec, os.path.join(d, "in.pdf"), d)
+        joined = " ".join(res["notes"])
+        self.assertIn("短边翻页", joined)
+        self.assertIn("横向对折", joined)
+
+        spec = pg.PrintSpec.from_form({"paper": "A4", "scale_mode": "fit",
+                                       "booklet": True, "booklet_subset": "back"})
+        spec.validate()
+        with mock.patch.object(pg, "run", side_effect=fake_run), \
+                mock.patch.object(pg, "gs_normalize", side_effect=fake_gs), \
+                mock.patch.object(pg, "impose", side_effect=fake_impose):
+            res = pg.build_final(spec, os.path.join(d, "in.pdf"), d)
+        self.assertIn("仅印背面，出纸为单面", " ".join(res["notes"]))
+
+
+class TestBookletLeafPairs(unittest.TestCase):
+    """
+    鞍式装订的硬不变量：**一张纸折出来的两片纸页，各自印两个连续的页码**。
+
+    这里刻意不重算 booklet_sides 的配对公式（那样等于抄一遍实现），而是照
+    物理装配的样子把整本还原出来读一遍：
+
+      * 一张纸折成两片：右半片、左半片；
+      * 右半片 = (正面右格, 背面左格)，左半片 = (背面右格, 正面左格)；
+      * 从最外层的右半片一路读到最外层的左半片，页码必须正好是 1..P。
+
+    配对错一格、左右写反、面序颠倒，这条都会挂。
+    """
+
+    def _assemble(self, faces):
+        """按物理装配顺序还原页码序列（空白位是 None）。"""
+        s = len(faces) // 2
+        order = []
+        for k in range(s):                       # 正面各纸的右半片，由外向内
+            order += [faces[2 * k]["right"], faces[2 * k + 1]["left"]]
+        for k in range(s - 1, -1, -1):           # 背面各纸的左半片，由内向外
+            order += [faces[2 * k + 1]["right"], faces[2 * k]["left"]]
+        return order
+
+    def test_assembly_reads_one_to_end(self):
+        for total in (1, 2, 3, 4, 5, 6, 8, 11, 12, 20):
+            padded = ((total + 3) // 4) * 4
+            faces = pg_layout.booklet_sides(total)
+            self.assertEqual(len(faces), padded // 2, total)
+
+            got = self._assemble(faces)
+            self.assertEqual(len(got), padded, total)
+            # 真实页必须按 1..total 顺序出现，且补出来的空白全在末尾
+            self.assertEqual([p for p in got if p is not None],
+                             list(range(1, total + 1)), total)
+            blank = padded - total
+            self.assertEqual(got[padded - blank:] if blank else [], [None] * blank,
+                             total)
+
+    def test_every_sheet_is_one_physical_sheet(self):
+        """一项配对只能出现在一张纸上 —— 重复出现意味着某半片被印了两次。"""
+        for total in (5, 8, 12):
+            faces = pg_layout.booklet_sides(total)
+            used = [p for f in faces for p in (f["left"], f["right"])]
+            self.assertEqual(sorted(p for p in used if p), list(range(1, total + 1)))
+            # 面序：每张纸严格「先正面后背面」
+            for k in range(0, len(faces), 2):
+                self.assertEqual([faces[k]["kind"], faces[k + 1]["kind"]],
+                                 ["front", "back"], total)
+                self.assertEqual(faces[k]["sheet"], faces[k + 1]["sheet"], total)
+                self.assertEqual(faces[k]["sheet"], k // 2 + 1, total)
+
+    def test_right_binding_only_swaps_left_and_right(self):
+        """右装订只是把每面的左右对调，配对与面序都不许变。"""
+        left = pg_layout.booklet_sides(12, "left")
+        right = pg_layout.booklet_sides(12, "right")
+        self.assertEqual(len(left), len(right))
+        for a, b in zip(left, right):
+            self.assertEqual((a["left"], a["right"]), (b["right"], b["left"]))
+            self.assertEqual((a["sheet"], a["kind"]), (b["sheet"], b["kind"]))
 
 
 if __name__ == "__main__":
