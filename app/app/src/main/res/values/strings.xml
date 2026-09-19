@@ -2,8 +2,12 @@
 <resources>
     <string name="app_name">自助打印</string>
 
+    <!-- 构建标识：扫码页与设置框都会显示。装没装上新包，看这一行就知道，
+         不用再靠「感觉还是不行」来来回回猜。 -->
+    <string name="app_build_fmt">App %1$s · 构建 %2$s</string>
+
     <string name="server_title">服务器设置</string>
-    <string name="server_msg">填写打印网关的地址（IP 或 IP:端口）。同一局域网内即可。</string>
+    <string name="server_msg">填写打印网关的地址。同一局域网填 IP:端口（如 192.168.1.100:8080）；从外网访问要连协议一起填（如 https://print.example.com:8443）。</string>
     <string name="token_hint">访问口令（网关未设口令则留空）</string>
     <string name="save_connect">保存并连接</string>
     <string name="cancel">取消</string>
@@ -20,8 +24,9 @@
 
     <string name="scan_title">扫码连接</string>
     <string name="scan_btn">扫码连接</string>
-    <string name="scan_hint">对准打印网关的二维码（内容是 http://IP:端口/?t=口令 的连接码）</string>
+    <string name="scan_hint">对准打印网关的二维码，尽量让它占满取景框。内网是 http://IP:端口/?t=口令，公网是 https://域名:8443/?t=口令（协议会原样保留）。</string>
     <string name="scan_permission_needed">没有相机权限，无法扫码。请到系统设置里开启相机权限。</string>
-    <string name="scan_bad_qr">不是有效的连接二维码。码的内容应为 http://IP:端口（可带 ?t=口令）</string>
+    <string name="scan_bad_qr">不是有效的连接二维码。码的内容应为 http(s)://地址（可带 ?t=口令）</string>
+    <string name="scan_seen_not_conn">识别到「%1$s」，但这不像是连接码 —— 请对准二维码图案本身</string>
     <string name="scan_no_camera">这台设备没有可用的相机</string>
 </resources>

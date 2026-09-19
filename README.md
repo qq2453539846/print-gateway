@@ -82,6 +82,8 @@ CUPS 2.4.2 自带的 `/printers/<队列>` 页面本身就能上传打印，但�
 - DDNS 定时同步 —— 家宽每天重新拨号也能跟上
 - 证书自动续期，`/admin` 管理页录入凭据、一键签发
 - 公网端口强制口令，内网扫码免密（二维码装不下口令，这个取舍是刻意的）
+- 管理页可把**内网 / 公网 / App 下载**三个连接码排成**贴纸**印出来（1 / 2 / 4 联），
+  贴在打印机旁；页面上的预览图可点开放大，方便另一台手机对着屏幕扫
 
 ---
 
@@ -96,6 +98,7 @@ server/            服务端（Python 3，HTTP 服务仅标准库）
   pg_dns.py          DNS 客户端（DNSPod Token 与腾讯云 TC3 两套签名）
   pg_admin.py        管理端支撑：凭据存储与掩码、acme.sh 封装、DDNS 同步、/admin 页面
   pg_ddns.py         定时任务入口（DDNS / 续期 / 状态）
+  pg_sticker.py      二维码贴纸：栅格排版（1 / 2 / 4 联）+ 无损 PDF 出纸
   gen_qr.py          纯标准库二维码生成器（SVG / PNG / PBM / 终端）
   setup_printer.py   USB 打印机识别与 CUPS 队列配置
   deploy_gateway.py  一键部署到远端（上传 + 写 unit + 启服务 + 自检）
@@ -299,9 +302,9 @@ Ghostscript 的 `/BeginPage` 等页面钩子对**多页文档只对首页生效*
 ## 测试
 
 ```bash
-# 单元测试（364 项）
+# 单元测试（427 项）
 python3 -m unittest test_pg_engine test_print_gateway test_gen_qr \
-                     test_pg_dns test_pg_admin test_pg_ddns
+                     test_pg_dns test_pg_admin test_pg_ddns test_pg_sticker
 
 # 端到端（建议打到落盘队列，勿打真机）
 python3 verify_e2e.py
@@ -310,7 +313,8 @@ python3 verify_e2e.py
 | 文件 | 覆盖重点 |
 |---|---|
 | `test_pg_engine.py` | 108 项：注入防护、裁剪/分割/装饰规范化、**预览档不改变版面**、**小册子纸型与双面档位由几何决定** |
-| `test_print_gateway.py` | 119 项：合并 PDF、上传上限、multipart 解析、小册子摘要、**预览档与出纸档分槽**、**管理页三道关**、**口令作用范围** |
+| `test_print_gateway.py` | 157 项：合并 PDF、上传上限、multipart 解析、小册子摘要、**预览档与出纸档分槽**、**管理页三道关**、**口令作用范围**、**贴纸生成与三码可用性** |
+| `test_pg_sticker.py` | 25 项：版式几何、模块边长取整、**按 marks 逐模块回读比对**、**真实解码器回读**、无中文/坏版式的明确报错 |
 | `test_pg_dns.py` | 33 项：公网 / CGNAT 判定、多源兜底、两套 API 读写语义、**「值没变就不发写请求」**、TC3 签名独立复算 |
 | `test_pg_admin.py` | 67 项：**掩码不会写成新值**、域名校验、内网判据 fail-closed、证书天数按 UTC 算、DDNS 只碰目标记录 |
 | `test_pg_ddns.py` | 14 项：未配置时安静跳过、失败返回非零、`--quiet` 透传 |
@@ -318,6 +322,9 @@ python3 verify_e2e.py
 | `verify_e2e.py` | 设备端到端：双标记定位法逐项核对页数 / 尺寸 / 页序 / 灰度 / 镜像 / 小册子配对 / 裁剪 / 分割映射 / 装饰 / 批量 |
 | `verify_qr.py` | 用 OpenCV 真实解码生成的二维码（需 `opencv-python-headless`） |
 | `verify_qr_ref.py` | 与成熟参考库 `qrcode` 的输出**逐位比对**矩阵（需 `qrcode`） |
+| `verify_sticker.py` | 设备端贴纸出纸：`pdfinfo` 读回必须是 A4、编码必须是 CCITT G4（无损）、再用 ghostscript 渲一遍 |
+| `verify_admin_qr.py` | 管理页二维码闭环：带 Cookie 抓页面 → 取预览图 → 抓 SVG → 还原位图 → **真解码** |
+| `verify_img_auth.py` | 外网预览图鉴权：所有图片请求都必须带口令，错一个就整片裂图 |
 
 **一个测试上的取舍值得说明**：断言的写法尽量选「不可能碰巧通过」的判据。
 比如验证「预览档不改变版面」时，判据不是「像素差小于某个阈值」，而是
@@ -388,7 +395,8 @@ python3 verify_e2e.py
 | 项目 | 用途 | 许可 |
 |---|---|---|
 | [python-qrcode](https://github.com/lincolnloop/python-qrcode) | **仅用于对照验证**：`verify_qr_ref.py` 把自研实现与它逐位比对矩阵 | BSD-3-Clause |
-| [OpenCV](https://opencv.org/) | **仅用于验证**：`verify_qr.py` 用真实解码器回读生成的二维码 | Apache-2.0 |
+| [zxing-cpp](https://github.com/zxing-cpp/zxing-cpp) | **仅用于验证**：`test_pg_sticker.py` 用它做真实解码回读，判定以它为准 | Apache-2.0 |
+| [OpenCV](https://opencv.org/) | **仅用于验证**：`verify_qr.py` 用真实解码器回读生成的二维码；`test_pg_sticker.py` 里作补充证据 | Apache-2.0 |
 | [NumPy](https://numpy.org/) | 同上，位图数组运算 | BSD-3-Clause |
 | [Paramiko](https://www.paramiko.org/) | 开发期 SSH 主机指纹采集脚本（未包含在本仓库） | LGPL-2.1 |
 
@@ -396,6 +404,13 @@ python3 verify_e2e.py
 > ISO/IEC 18004，没有拷贝任何第三方实现。`qrcode` 参考库的作用是反向证明 ——
 > 如果自研矩阵与成熟库逐位一致，说明位流构造、RS 纠错、块交错、掩码选择全都对。
 > 这种「与独立实现比对」的验证方式，比只看二维码「长得像」可靠得多。
+
+> **为什么真解码验证优先用 zxing-cpp 而不是 OpenCV**：OpenCV 的 `QRCodeDetector`
+> 有盲区。实测过一个**完全合法**的矩阵 —— payload 只差一个数字，于是标准罚分最优的
+> 掩码不同 —— zxing-cpp 读得出，OpenCV 死活读不出（同一矩阵换 8 个掩码里的另外 7 个，
+> OpenCV 全都读得出，只有那个读不出）。自研编码器在该数据上的罚分与参考库
+> `qrcode.util.lost_point` **逐分完全一致**，也就是说码没有问题，是检测器的问题。
+> 若把 OpenCV 当唯一判据，测试会随数据忽红忽绿，还会把人骗去改一个本来正确的编码器。
 
 ### 参考标准与规范
 

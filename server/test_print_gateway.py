@@ -8,19 +8,25 @@ print_gateway 核心逻辑测试。
 import os
 import shutil
 import socket
+import ssl
+import subprocess
 import sys
+import threading
+import time
 import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import re                                                     # noqa: E402
 import tempfile                                               # noqa: E402
+import urllib.parse                                           # noqa: E402
 
 import print_gateway as pg                                    # noqa: E402
 import pg_admin                                               # noqa: E402
 import pg_decor                                               # noqa: E402
 import pg_engine                                              # noqa: E402
 import pg_layout                                              # noqa: E402
+import pg_sticker                                             # noqa: E402
 from pg_engine import PrintSpec                               # noqa: E402
 
 
@@ -983,11 +989,25 @@ class TestTlsWiring(unittest.TestCase):
         src = inspect.getsource(pg.DualStackServer.server_bind)
         self.assertIn("IPV6_V6ONLY", src)
 
-    def test_wrap_tls_sets_minimum_version(self):
+    def test_make_tls_context_minimum_version(self):
+        """TLS 上下文只认 1.2+，且**不再碰监听套接字**（握手归每连接线程）。"""
         import inspect
-        src = inspect.getsource(pg.wrap_tls)
+        src = inspect.getsource(pg.make_tls_context)
         self.assertIn("TLSv1_2", src)
         self.assertIn("load_cert_chain", src)
+        self.assertNotIn("httpd.socket", src)
+        self.assertNotIn("wrap_socket", src)
+
+    def test_main_never_wraps_the_listening_socket(self):
+        """
+        回归 2026-09-19 事故：把 TLS 套在监听套接字上，accept 循环会在握手处阻塞，
+        一条「连上不发 ClientHello」的扫描器连接就能永久打死公网入口。
+        """
+        import inspect
+        src = inspect.getsource(pg.main)
+        self.assertNotIn("wrap_socket(", src)
+        self.assertNotIn("wrap_tls(", src)
+        self.assertIn("tls_context", src)
 
     def test_handler_has_tls_fields(self):
         self.assertTrue(hasattr(pg.Handler, "tls_enabled"))
@@ -1015,6 +1035,161 @@ class TestDualStackSockets(unittest.TestCase):
                 conn.close()
             except OSError as exc:
                 self.fail("%s 连不上双栈监听：%s" % (addr, exc))
+
+
+def _self_signed_cert(tmpdir):
+    """用 openssl 现造一张自签证书。没有 openssl 就返回 None（测试自动跳过）。"""
+    exe = shutil.which("openssl")
+    if not exe:
+        return None
+    crt = os.path.join(tmpdir, "t.crt")
+    key = os.path.join(tmpdir, "t.key")
+    proc = subprocess.run(
+        [exe, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+         "-keyout", key, "-out", crt, "-days", "2", "-subj", "/CN=localhost"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if proc.returncode != 0 or not (os.path.isfile(crt) and os.path.isfile(key)):
+        return None
+    return crt, key
+
+
+class _EchoHandler(pg.BaseHTTPRequestHandler):
+    """只管回 200，不碰作业存储 —— 让测试聚焦在监听与握手行为上。"""
+
+    def do_GET(self):
+        body = b"ok"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):                                  # noqa: A003
+        pass
+
+
+class TestTlsHandshakeOffAcceptLoop(unittest.TestCase):
+    """
+    TLS 握手必须在**每连接线程**里做，不能在 accept 循环里做。
+
+    回归 2026-09-19 的事故：TLS 套在监听套接字上时，标准库的
+    `SSLSocket.accept()` 是「accept + 同步握手」且没有超时 ——
+    一条「TCP 连上但不发 ClientHello」的扫描器连接（66.132.x.x / 115.231.x.x），
+    就把公网 8443 永久卡死了：`ss -lnt` 的 Recv-Q 顶到 backlog 不归零，
+    连设备本机都连不上自己的 8443。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="gw-tls-")
+        got = _self_signed_cert(cls.tmp)
+        if got is None:
+            shutil.rmtree(cls.tmp, ignore_errors=True)
+            raise unittest.SkipTest("本机没有 openssl，无法现造自签证书")
+        cls.crt, cls.key = got
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def _start(self):
+        srv = pg.tls_server_class(False)(("127.0.0.1", 0), _EchoHandler)
+        srv.tls_context = pg.make_tls_context(self.crt, self.key)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1]
+
+    def _silent(self, port, delay=0.4):
+        """连上就不说话 —— 端口扫描器的标准动作。"""
+        conn = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.addCleanup(conn.close)
+        if delay:
+            time.sleep(delay)
+        return conn
+
+    def _tls_get(self, port, timeout=6.0):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        raw = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        with raw, ctx.wrap_socket(raw, server_hostname="localhost") as tls:
+            tls.settimeout(timeout)
+            tls.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            return tls.recv(65536)
+
+    def test_silent_connection_does_not_wedge_the_loop(self):
+        """核心回归：一条静默连接不能挡住后面的正常请求。"""
+        port = self._start()
+        self._silent(port)
+        body = self._tls_get(port)
+        self.assertIn(b" 200 ", body.split(b"\r\n")[0])
+
+    def test_garbage_handshake_is_dropped_and_server_survives(self):
+        """发垃圾字节（不是 ClientHello）也要被丢掉，且不影响后续服务。"""
+        port = self._start()
+        junk = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.addCleanup(junk.close)
+        junk.sendall(b"\x16\x03\x01" + b"not-a-clienthello" * 4)
+        time.sleep(0.4)
+        body = self._tls_get(port)
+        self.assertIn(b" 200 ", body.split(b"\r\n")[0])
+
+    def test_many_silent_connections_still_serve(self):
+        """一堆扫描器同时挂住，正常用户仍要立刻拿到页面。"""
+        port = self._start()
+        for _ in range(6):
+            self._silent(port, delay=0.0)
+        time.sleep(0.5)
+        body = self._tls_get(port)
+        self.assertIn(b" 200 ", body.split(b"\r\n")[0])
+
+    def test_handshake_is_bounded_by_timeout(self):
+        """静默连接占用的是「限时的」线程，不是「无限期的」accept 循环。"""
+        import inspect
+        src = inspect.getsource(pg.TLSHandshakeMixin.process_request_thread)
+        self.assertIn("settimeout(TLS_HANDSHAKE_TIMEOUT)", src)
+        self.assertGreater(pg.TLS_HANDSHAKE_TIMEOUT, 0)
+
+    def test_get_request_only_accepts(self):
+        """get_request 只做 accept，源码里不许出现 wrap_socket。"""
+        import inspect
+        src = inspect.getsource(pg.TLSHandshakeMixin.get_request)
+        self.assertIn("self.socket.accept()", src)
+        self.assertNotIn("wrap_socket", src)
+
+
+class TestListenBacklog(unittest.TestCase):
+    """
+    backlog 必须靠**类属性**传到内核 —— 构造之后再赋值，对已经 listen 过的
+    套接字毫无作用。2026-09-19 实测原来那样写 Send-Q 一直是默认的 5，
+    多台手机同时上传就会被拒。
+    """
+
+    def test_backlog_is_a_class_attribute(self):
+        self.assertIn("request_queue_size", pg.QueueHTTPServer.__dict__)
+        self.assertEqual(pg.QueueHTTPServer.request_queue_size, pg.SERVER_BACKLOG)
+        self.assertGreaterEqual(pg.SERVER_BACKLOG, 64)
+        self.assertEqual(pg.DualStackServer.request_queue_size, pg.SERVER_BACKLOG)
+
+    def test_backlog_reaches_the_kernel(self):
+        """真起监听，用 ss 读回 Send-Q，确认不是默认的 5。"""
+        if not shutil.which("ss"):
+            self.skipTest("本机没有 ss，无法读回监听队列")
+        srv = pg.QueueHTTPServer(("127.0.0.1", 0), _EchoHandler)
+        self.addCleanup(srv.server_close)
+        port = srv.server_address[1]
+        try:
+            out = subprocess.run(["ss", "-lnt"], capture_output=True,
+                                 text=True, timeout=10).stdout
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.skipTest("执行 ss 失败：%s" % exc)
+        row = [ln for ln in out.splitlines() if (":%d " % port) in ln]
+        if not row:
+            self.skipTest("ss 输出里没找到端口 %d" % port)
+        fields = row[0].split()                    # LISTEN Recv-Q Send-Q Local Peer
+        self.assertEqual(int(fields[2]), pg.SERVER_BACKLOG,
+                         "backlog 没传到内核，ss 看到的是 %s" % fields[2])
 
 
 class TestTokenScope(unittest.TestCase):
@@ -1130,6 +1305,323 @@ class TestPublicUrl(unittest.TestCase):
 
     def test_page_shows_url_only_when_available(self):
         self.assertIn("st.public_url", pg_admin.ADMIN_PAGE)
+
+
+class TestPreviewImageAuth(unittest.TestCase):
+    """
+    预览图 `/img` 的鉴权闭环。
+
+    `/img` 在 `_authed()` **之后**，所以公网端口上「URL 里没带口令」= HTTP 401 =
+    用户看到整片裂图（内网免密，所以只在公网暴露）。
+
+    这个坑同时存在于两处 —— 服务端生成 URL 时没拼口令、前端 `<img src>` 没走
+    `api()`。两边都钉住，否则修一处漏一处。
+    """
+
+    KEY = "81d450118e314005"
+
+    def _job(self, jid="eb9d06cd2a76"):
+        return mock.Mock(id=jid)                  # _preview_urls 只用到 id
+
+    def _entry(self, n=2):
+        return {"images": ["/tmp/j/build-x/preview-%d.png" % i
+                           for i in range(1, n + 1)]}
+
+    def _h(self, token="s3cret", on_tls=True, always=False, query=""):
+        h = pg.Handler.__new__(pg.Handler)
+        h.path = "/img" + query
+        h.token = token
+        h.token_always = always
+        h.headers = {}
+        h.server = mock.Mock(is_tls=on_tls)
+        return h
+
+    def test_every_url_carries_the_token(self):
+        urls = self._h()._preview_urls(self._job(), self.KEY, self._entry())
+        self.assertEqual(len(urls), 2)
+        for u in urls:
+            self.assertIn("&t=s3cret", u)
+
+    def test_url_keeps_job_key_and_page(self):
+        url = self._h()._preview_urls(self._job(), self.KEY, self._entry(1))[0]
+        self.assertTrue(url.startswith("/img?job=eb9d06cd2a76&k=" + self.KEY + "&n=1"),
+                        url)
+
+    def test_generated_url_passes_its_own_auth(self):
+        """核心闭环：服务端自己生成的 URL，必须能过服务端自己的鉴权。"""
+        url = self._h()._preview_urls(self._job(), self.KEY, self._entry(1))[0]
+        query = "?" + urllib.parse.urlparse(url).query
+        self.assertTrue(self._h(query=query)._authed())
+
+    def test_url_without_token_is_401_territory(self):
+        """对照组：老版本的 URL 形态在公网端口上就是 401（整片裂图的成因）。"""
+        self.assertFalse(
+            self._h(query="?job=eb9d06cd2a76&k=%s&n=1" % self.KEY)._authed())
+
+    def test_token_is_url_encoded(self):
+        """口令里可能有 + & = 之类字符，不编码会把 query 拆坏。"""
+        h = self._h(token="a b&c=d")
+        url = h._preview_urls(self._job(), self.KEY, self._entry(1))[0]
+        self.assertIn("&t=a%20b%26c%3Dd", url)
+        query = "?" + urllib.parse.urlparse(url).query
+        self.assertTrue(self._h(token="a b&c=d", query=query)._authed())
+
+    def test_no_token_configured_adds_nothing(self):
+        url = self._h(token="")._preview_urls(self._job(), self.KEY, self._entry(1))[0]
+        self.assertNotIn("&t=", url)
+
+    def test_lan_port_ignores_token_anyway(self):
+        """内网明文端口免密：URL 里拼了口令也不影响，不拼也照样能取图。"""
+        self.assertTrue(self._h(on_tls=False, query="?job=x")._authed())
+        self.assertTrue(self._h(on_tls=False, query="?job=x&t=s3cret")._authed())
+
+    def test_frontend_img_src_goes_through_api_helper(self):
+        """
+        前端那道保险：`<img src>` 必须走 api() 补口令。
+        别再改回 `img.src = src` —— 那正是「内网好好的、外网预览全裂」的成因。
+        """
+        self.assertIn("img.src = api(src)", pg.PAGE)
+        self.assertNotIn("img.src = src;", pg.PAGE)
+
+    def test_img_route_is_still_behind_auth(self):
+        """
+        反面对照：不能为了省事把 /img 挪到鉴权之前。
+        URL 里的 k 是**无盐**的 spec 哈希，参数组合空间很小，够不上凭证。
+        """
+        import inspect
+        src = inspect.getsource(pg.Handler.do_GET)
+        self.assertLess(src.index("self._authed()"), src.index('path == "/img"'))
+
+
+class TestStickerRoutes(unittest.TestCase):
+    """
+    管理页的「二维码贴纸」：单码预览 SVG + 生成一个贴纸作业。
+
+    这里把 `lan_ip` 与 `pdf_info` 都替掉了 —— 前者随开发机的网络环境变，
+    后者依赖 poppler（开发机上通常没有，设备上才有）。**PDF 本身是真的
+    生成的**，只是页数/尺寸这一跳交给 mock。完整的端到端（含 poppler
+    读回、真出纸）由设备上的 `verify_sticker.py` 做。
+    """
+
+    SECRETS = {"record": {"root": "example.com", "sub": "print"}}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sticker-route-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        for patcher in (
+            mock.patch.object(pg_sticker, "lan_ip",
+                              return_value="192.168.1.100"),
+            mock.patch.object(pg_admin, "load_secrets",
+                              return_value=dict(self.SECRETS)),
+            mock.patch.object(pg_engine, "pdf_info",
+                              return_value=(1, [(595.276, 841.89)])),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _handler(self, path, body=None, tls=True, token="tok123",
+                 apk="", host="192.168.1.100"):
+        h = pg.Handler.__new__(pg.Handler)          # 不跑 __init__，避免真开端口
+        h.path = path
+        h.client_address = ("192.168.1.50", 43210)
+        h.admin_token = "s3cret"
+        h.tls_enabled = tls
+        h.tls_port = 8443 if tls else 0
+        h.http_port = 8080
+        h.host_display = host
+        h.token = token
+        h.apk_path = apk
+        h.store = pg.JobStore(self.tmp)
+        h.headers = {}
+        sent = {}
+        h._send = lambda code, b, ctype, extra=None: sent.update(
+            code=code, body=b, ctype=ctype, extra=extra or {})
+        h._err = lambda msg, code=400: sent.update(code=code, obj={"error": msg})
+        h._json = lambda obj, code=200: sent.update(code=code, obj=obj)
+        h._json_body = lambda: (body or {})
+        return h, sent
+
+    # -------------------------------------------------------- 路由与页面
+    def test_routes_registered(self):
+        self.assertIn("/admin/qr.svg", pg.Handler._ADMIN_GETS)
+        self.assertIn("/admin/api/sticker", pg.Handler._ADMIN_POSTS)
+
+    def test_admin_page_has_sticker_controls(self):
+        for marker in ('id="stickerBox"', 'id="stLayout"',
+                       'id="bSticker"', 'id="stWarn"'):
+            self.assertIn(marker, pg_admin.ADMIN_PAGE, marker)
+
+    def test_page_previews_fetch_svg_from_server(self):
+        """预览图必须走 /admin/qr.svg（服务端按 kind 现算），
+        不能让前端把 URL 当参数传 —— 那就成了一个任意二维码接口。"""
+        self.assertIn("/admin/qr.svg?kind=", pg_admin.ADMIN_PAGE)
+        self.assertNotIn("qr.svg?url=", pg_admin.ADMIN_PAGE)
+
+    def test_page_zooms_preview_for_scanning(self):
+        """
+        预览图要能点开放大 —— 否则屏幕上的码根本扫不动。
+
+        公网码内容是 64 个字符 = QR 版本 5（37 模块），加静区 2 共 41 模块；
+        管理页把它压在 CSS 132px 里，折算只有 3.2px/模块。实测（本机真解码）
+        把这串内容按 96px 栅格化就已经解不出来。放大到 320px（≈7.8px/模块）
+        才留出斜拍、隔远的余量。
+
+        两条都要在：图放大；点击处 preventDefault —— 图片在 <label> 里，
+        不挡默认行为的话「点一下放大」会顺手把这张码勾选/取消掉。
+        """
+        page = pg_admin.ADMIN_PAGE
+        self.assertIn('id="qrZoom"', page)
+        self.assertIn('id="qrZoomImg"', page)
+        self.assertIn("min(78vw,320px)", page)
+        self.assertIn("e.preventDefault()", page)
+
+    # -------------------------------------------------------- 码的内容
+    def test_lan_code_uses_lan_address_not_domain(self):
+        h, _ = self._handler("/admin/qr.svg?kind=lan")
+        codes, skipped = h._sticker_codes(["lan"])
+        self.assertEqual(skipped, [])
+        self.assertEqual(codes[0].url, "http://192.168.1.100:8080/")
+
+    def test_wan_code_carries_the_token(self):
+        """公网那条路必须带口令 —— 不带就是印一张扫开 401 的废纸。"""
+        h, _ = self._handler("/admin/qr.svg?kind=wan")
+        codes, _ = h._sticker_codes(["wan"])
+        self.assertEqual(codes[0].url, "https://print.example.com:8443/?t=tok123")
+
+    def test_app_code_points_at_download_page(self):
+        apk = os.path.join(self.tmp, "x.apk")
+        with open(apk, "wb") as fh:
+            fh.write(b"apk")
+        h, _ = self._handler("/admin/qr.svg?kind=app", apk=apk)
+        codes, _ = h._sticker_codes(["app"])
+        self.assertEqual(codes[0].url, "http://192.168.1.100:8080/app")
+
+    # -------------------------------------------------------- 可用性
+    def test_wan_unavailable_without_tls(self):
+        h, sent = self._handler("/admin/qr.svg?kind=wan", tls=False)
+        h._admin_action("/admin/qr.svg", False)
+        self.assertEqual(sent["code"], 404)
+
+    def test_wan_available_with_tls(self):
+        h, sent = self._handler("/admin/qr.svg?kind=wan")
+        h._admin_action("/admin/qr.svg", False)
+        self.assertEqual(sent["code"], 200)
+
+    def test_app_unavailable_without_apk(self):
+        h, sent = self._handler("/admin/qr.svg?kind=app")
+        h._admin_action("/admin/qr.svg", False)
+        self.assertEqual(sent["code"], 404)
+        self.assertIn("APK", h._sticker_avail()["app"][1])
+
+    def test_unknown_kind_is_not_a_code(self):
+        h, sent = self._handler("/admin/qr.svg?kind=../../etc/passwd")
+        h._admin_action("/admin/qr.svg", False)
+        self.assertEqual(sent["code"], 404)
+
+    # -------------------------------------------------------- SVG 预览
+    def test_svg_preview_is_served(self):
+        h, sent = self._handler("/admin/qr.svg?kind=lan")
+        h._admin_action("/admin/qr.svg", False)
+        self.assertEqual(sent["code"], 200)
+        self.assertIn("image/svg+xml", sent["ctype"])
+        self.assertTrue(sent["body"].startswith(b"<?xml"))
+        self.assertIn(b"</svg>", sent["body"])
+
+    def test_svg_preview_not_cached(self):
+        h, sent = self._handler("/admin/qr.svg?kind=lan")
+        h._admin_action("/admin/qr.svg", False)
+        self.assertIn("no-store", sent["extra"].get("Cache-Control", ""))
+
+    # -------------------------------------------------------- 生成贴纸
+    def _fake_apk(self):
+        apk = os.path.join(self.tmp, "fake.apk")
+        with open(apk, "wb") as fh:
+            fh.write(b"apk")
+        return apk
+
+    def test_sticker_creates_a_real_pdf_job(self):
+        h, sent = self._handler("/admin/api/sticker",
+                                body={"kinds": ["lan", "wan", "app"],
+                                      "layout": 1}, apk=self._fake_apk())
+        h._admin_action("/admin/api/sticker", True)
+        self.assertEqual(sent["code"], 200)
+
+        job = h.store.get(sent["obj"]["id"])
+        self.assertIsNotNone(job, "作业没注册进 store，跳转过去会 404")
+        self.assertTrue(os.path.exists(job.source_pdf))
+        with open(job.source_pdf, "rb") as fh:
+            self.assertTrue(fh.read(8).startswith(b"%PDF"))
+        self.assertEqual(job.files, 1)
+        self.assertEqual(sent["obj"]["codes"], ["lan", "wan", "app"])
+        self.assertEqual(sent["obj"]["skipped"], [])
+
+    def test_sticker_records_layout_in_filename(self):
+        for layout, want in ((1, "整页 1 张"), (2, "A5 两张"), (4, "A6 四张")):
+            h, sent = self._handler("/admin/api/sticker",
+                                    body={"kinds": ["lan"], "layout": layout})
+            h._admin_action("/admin/api/sticker", True)
+            self.assertEqual(sent["code"], 200)
+            self.assertIn(want, h.store.get(sent["obj"]["id"]).filename)
+
+    def test_sticker_reports_skipped_kinds(self):
+        """选了但没有的码要如实报回来 —— 前端才好提示「App 码没印」。"""
+        h, sent = self._handler("/admin/api/sticker",
+                                body={"kinds": ["lan", "wan", "app"],
+                                      "layout": 2}, apk="")
+        h._admin_action("/admin/api/sticker", True)
+        self.assertEqual(sent["code"], 200)
+        self.assertEqual(sent["obj"]["codes"], ["lan", "wan"])
+        self.assertEqual(sent["obj"]["skipped"], ["app"])
+
+    def test_sticker_rejects_bad_layout(self):
+        for bad in (0, 3, 8, "x"):
+            h, sent = self._handler("/admin/api/sticker",
+                                    body={"kinds": ["lan"], "layout": bad})
+            h._admin_action("/admin/api/sticker", True)
+            self.assertEqual(sent["code"], 400, bad)
+
+    def test_sticker_needs_at_least_one_code(self):
+        """探测不到内网地址、又没启 HTTPS、也没放 APK —— 三种码全废，
+        这时候必须明说，而不是印一张三个码都扫不开的纸。"""
+        with mock.patch.object(pg_sticker, "lan_ip", return_value=""):
+            h, sent = self._handler("/admin/api/sticker",
+                                    body={"kinds": [], "layout": 1},
+                                    tls=False, host="")
+            h._admin_action("/admin/api/sticker", True)
+        self.assertEqual(sent["code"], 400)
+        self.assertIn("没有可用的二维码", sent["obj"]["error"])
+
+    def test_failed_generation_leaves_no_job(self):
+        """生成失败必须把作业目录清掉 —— 不然每次失败都在 /tmp 下留一份垃圾。"""
+        h, sent = self._handler("/admin/api/sticker",
+                                body={"kinds": ["lan"], "layout": 1})
+        before = set(os.listdir(self.tmp))
+        with mock.patch.object(pg_sticker, "build_pdf",
+                               side_effect=pg_sticker.StickerError("boom")):
+            h._admin_action("/admin/api/sticker", True)
+        self.assertEqual(sent["code"], 400)
+        self.assertIn("boom", sent["obj"]["error"])
+        self.assertEqual(set(os.listdir(self.tmp)), before)
+
+    # -------------------------------------------------------- status
+    def test_status_exposes_sticker_availability(self):
+        h, sent = self._handler("/admin/api/status")
+        h._admin_action("/admin/api/status", False)
+        self.assertEqual(sent["code"], 200)
+        info = sent["obj"].get("sticker")
+        self.assertIsInstance(info, dict)
+        for kind in ("lan", "wan", "app"):
+            self.assertIn(kind, info)
+            self.assertIn("available", info[kind])
+        self.assertTrue(info["lan"]["available"])
+        self.assertTrue(info["wan"]["available"])
+
+    def test_status_reports_why_a_code_is_unavailable(self):
+        h, sent = self._handler("/admin/api/status", tls=False)
+        h._admin_action("/admin/api/status", False)
+        wan = sent["obj"]["sticker"]["wan"]
+        self.assertFalse(wan["available"])
+        self.assertTrue(wan["reason"], "不可用却不给原因，界面上就只剩一句干瞪眼")
 
 
 if __name__ == "__main__":

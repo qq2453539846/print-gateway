@@ -13,8 +13,14 @@ android {
         // 且 8.0 以下设备已极为罕见。图标因此可以纯 vector 实现，无需位图。
         minSdk 26
         targetSdk 34
-        versionCode 1
-        versionName "1.0"
+        // 每改一次 App 代码就往上加。**这个号必须在 App 里看得见** ——
+        // 2026-09-19 就是栽在这：扫码修复写进了 Kotlin 源码但没重新构建，
+        // 手机上跑的还是旧包，排查了半天才发现。能一眼报出版本就没有这种问题。
+        versionCode 2
+        versionName "1.1"
+        // 构建时间戳，配置阶段现算。放在包里而不是靠文件名/记忆。
+        buildConfigField "String", "BUILD_STAMP",
+                "\"${new Date().format('MMdd-HHmm')}\""
     }
 
     signingConfigs {
@@ -51,6 +57,8 @@ android {
 
     buildFeatures {
         viewBinding true
+        // 需要它才能用 buildConfigField（AGP 8 起默认关闭）
+        buildConfig true
     }
 
     lint {

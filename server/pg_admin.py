@@ -641,6 +641,33 @@ overflow:auto;max-height:240px;margin:10px 0 0;white-space:pre-wrap;
 word-break:break-all;display:none}
 pre.show{display:block}
 .hint{font-size:12px;color:var(--muted);margin-top:8px;line-height:1.8}
+.qrgrid{display:flex;gap:10px;flex-wrap:wrap}
+.qrcell{flex:1 1 130px;min-width:130px;border:1px solid var(--line);border-radius:9px;
+padding:10px;text-align:center;background:#fff;cursor:pointer}
+.qrcell.on{border-color:var(--accent);background:var(--accent-soft)}
+.qrcell.off{opacity:.5;cursor:not-allowed}
+.qrcell img{width:100%;max-width:132px;height:auto;display:block;margin:6px auto;
+cursor:zoom-in}
+/* 点开放大。屏幕上的 132px 预览对手机摄像头太密了：公网码 64 字符 = QR 版本 5
+   （37 模块）+ 静区，折算下来只有 3.2px/模块；实测再小到 96px 就彻底解不出来。
+   放大到 320px 约 7.8px/模块，斜着拍、隔半米拍都还有余量。 */
+#qrZoom{position:fixed;inset:0;background:rgba(0,0,0,.75);display:none;z-index:99;
+align-items:center;justify-content:center;flex-direction:column;gap:14px;padding:20px}
+#qrZoom.show{display:flex}
+#qrZoom .zcard{background:#fff;border-radius:14px;padding:16px;text-align:center;
+max-width:min(92vw,420px)}
+#qrZoom .zcard img{width:min(78vw,320px);height:auto;display:block;margin:0 auto}
+#qrZoom .zurl{color:var(--muted);font-size:11px;word-break:break-all;
+margin-top:8px;max-width:min(78vw,320px)}
+#qrZoom .ztip{color:#f2f3f5;font-size:13px;line-height:1.7;text-align:center;
+max-width:min(92vw,420px)}
+.qrcell b{display:block;font-size:13px}
+.qrcell span{display:block;font-size:11px;color:var(--muted);word-break:break-all;
+line-height:1.5;margin-top:2px}
+.qrcell .blank{height:132px;display:flex;align-items:center;justify-content:center;
+color:var(--muted);font-size:12px}
+.warnbox{background:#fdf6e7;border:1px solid #f0dcb0;color:var(--warn);
+border-radius:8px;padding:9px 11px;font-size:12.5px;line-height:1.7;margin-top:10px}
 .hide{display:none}
 @media(max-width:520px){.row{flex-wrap:wrap}.row>label{flex:0 0 100%;margin-bottom:2px}}
 </style>
@@ -656,6 +683,34 @@ pre.show{display:block}
   <div class="card">
     <h2>公开访问<span class="sub">只读</span></h2>
     <div class="kv" id="overview">读取中…</div>
+  </div>
+
+  <div class="card">
+    <h2>二维码贴纸<span class="sub">印出来贴在打印机旁，扫码即用</span></h2>
+    <div id="stickerBox"><div class="kv">读取中…</div></div>
+    <div class="row" style="margin-top:12px">
+      <label>每页版式</label>
+      <select id="stLayout">
+        <option value="1">整页 1 张（码最大）</option>
+        <option value="2">A5 两张（剪开分贴）</option>
+        <option value="4">A6 四张（名片大小）</option>
+      </select>
+    </div>
+    <div id="stWarn"></div>
+    <div class="btns">
+      <button class="primary" id="bSticker">生成贴纸并预览</button>
+      <span style="color:var(--muted);font-size:12px;align-self:center">生成后进打印面板，可看预览再出纸</span>
+    </div>
+  </div>
+
+  <!-- 放大看 / 放大扫。图仍走那个只读接口 /admin/qr.svg，内容由服务端按 kind 现算，
+       前端只是把它渲染大一点，不参与决定码里写什么 -->
+  <div id="qrZoom">
+    <div class="zcard">
+      <img id="qrZoomImg" alt="连接码">
+      <div class="zurl" id="qrZoomUrl"></div>
+    </div>
+    <div class="ztip">把手机对准这个放大的二维码扫描。<br>点任意处或按 Esc 关闭</div>
   </div>
 
   <div class="card">
@@ -838,6 +893,45 @@ function render(st){
   setHint('#dpKey', dp.has_key ? dp.key : '', 'Token Key');
   setHint('#tId', tc.has_id ? tc.secret_id : '', 'SecretId');
   setHint('#tKey', tc.has_key ? tc.secret_key : '', 'SecretKey');
+
+  renderSticker(st);
+}
+
+var QR_KINDS = ['lan', 'wan', 'app'];
+
+// 贴纸预览。图不走 JSON，直接让 <img> 去取 /admin/qr.svg?kind=xxx ——
+// 内容由服务端按 kind 现算，前端不传 URL（否则这就是个任意二维码接口了）。
+function renderSticker(st){
+  var info = st.sticker || {};
+  var html = '<div class="qrgrid">';
+  QR_KINDS.forEach(function(k){
+    var it = info[k] || {};
+    var ok = !!it.available;
+    html += '<label class="qrcell ' + (ok ? 'on' : 'off') + '">'
+      + '<input type="checkbox" class="qrk" value="' + k + '"'
+      + (ok ? ' checked' : ' disabled') + '>'
+      + (ok ? '<img src="/admin/qr.svg?kind=' + k + '" alt="' + k + '">'
+            : '<div class="blank">当前不可用</div>')
+      + '<b>' + (it.label || k) + '</b>'
+      + '<span>' + (ok ? it.sub : (it.reason || '不可用')) + '</span>'
+      + '</label>';
+  });
+  html += '</div>';
+  $('#stickerBox').innerHTML = html;
+
+  Array.prototype.forEach.call(document.querySelectorAll('.qrk'), function(cb){
+    cb.addEventListener('change', function(){
+      this.closest('.qrcell').classList.toggle('on', this.checked);
+    });
+  });
+
+  // 公网码里带着口令 —— 这条必须说清楚，不然贴出去等于开放打印权限
+  var wan = info.wan || {};
+  $('#stWarn').innerHTML = wan.available
+    ? '<div class="warnbox"><b>注意：公网码里带着访问口令。</b>'
+      + '贴纸一旦贴到别人也能看到的地方，等于把口令公开 —— '
+      + '外网任何人扫一下就能打印。只在自己能掌握范围的机器旁用它。</div>'
+    : '';
 }
 
 function setHint(sel, masked, label){
@@ -931,6 +1025,44 @@ $('#bForce').addEventListener('click', function(){
   if(!confirm('强制重签：会向 Let\'s Encrypt 重新申请一次证书。继续？')) return;
   withBusy(this, '重签中…', function(){ return issue(true); });
 });
+
+$('#bSticker').addEventListener('click', function(){
+  var kinds = [];
+  Array.prototype.forEach.call(document.querySelectorAll('.qrk'), function(cb){
+    if(cb.checked) kinds.push(cb.value);
+  });
+  if(!kinds.length){ msg('至少选一个二维码', 'err'); return; }
+  var layout = parseInt($('#stLayout').value, 10) || 1;
+  withBusy(this, '生成中…', function(){
+    // 生成的是一个**作业**，不是直接出纸 —— 跳到打印面板让用户先看预览、
+    // 选打印机和纸盒。份数、纸型这些面板里本来就有。
+    return req('sticker', {kinds: kinds, layout: layout}).then(function(r){
+      msg('已生成，正在打开打印面板…');
+      location.href = '/?job=' + encodeURIComponent(r.id);
+    });
+  });
+});
+
+// 点小图放大 —— 放大了才好扫。
+// 这里必须 preventDefault：图片在 <label> 里，不挡掉默认行为的话，点一下会
+// 顺手把这张码勾选/取消掉，而用户的本意只是「放大看看能不能扫」。
+(function(){
+  var zi = $('#qrZoomImg'), zu = $('#qrZoomUrl'), box = $('#qrZoom');
+  document.addEventListener('click', function(e){
+    var t = e.target;
+    if(!t || t.tagName !== 'IMG' || !t.closest('.qrcell')) return;
+    e.preventDefault();
+    zi.src = t.getAttribute('src');
+    var sub = t.parentNode.querySelector('span');
+    zu.textContent = sub ? sub.textContent : '';
+    box.classList.add('show');
+  }, true);
+  function close(){ box.classList.remove('show'); zi.removeAttribute('src'); }
+  box.addEventListener('click', function(e){ e.preventDefault(); close(); });
+  document.addEventListener('keydown', function(e){
+    if(e.key === 'Escape' || e.keyCode === 27) close();
+  });
+})();
 
 refresh().catch(function(e){ msg('加载状态失败：' + e.message, 'err'); });
 </script>

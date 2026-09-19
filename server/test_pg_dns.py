@@ -58,7 +58,7 @@ class TestPublicIpv4(unittest.TestCase):
             self.assertFalse(pg_dns.is_public_ipv4(ip), ip)
 
     def test_rejects_non_ipv4(self):
-        for text in ("", "abc", "2001:db8:1:2::1", "1.2.3", "999.1.1.1"):
+        for text in ("", "abc", "2001:4860:4860::1", "1.2.3", "999.1.1.1"):
             self.assertFalse(pg_dns.is_public_ipv4(text), text)
 
 

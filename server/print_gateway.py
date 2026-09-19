@@ -49,6 +49,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pg_admin
 import pg_engine
 import pg_layout
+import pg_sticker
 from pg_engine import EngineError, PrintSpec
 
 LOG = logging.getLogger("print-gateway")
@@ -58,11 +59,20 @@ MAX_UPLOAD_MB = 50
 MAX_FILES = 10
 # 界面版本号（显示在页面右上角）。改动前端时一并递增 ——
 # 用户报「怎么改了没生效」时，第一件事就是看他看到的是哪个版本。
-VERSION = "v3.6 0918"
+VERSION = "v3.10 0919"
+# 二维码贴纸的版式名（一页印几张）
+_LAYOUT_LABEL = {1: "整页 1 张", 2: "A5 两张", 4: "A6 四张"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".webp"}
 PDF_EXTS = {".pdf"}
 JOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 HASH_RE = re.compile(r"^[0-9a-f]{16}$")
+
+# 单条连接的 TLS 握手必须限时。公网端口常年被扫描器敲门，而扫描器最典型的动作
+# 就是「TCP 连上就不说话」——没有超时的话它会一直占着处理它的那个线程不放。
+TLS_HANDSHAKE_TIMEOUT = 8.0
+# 监听队列长度。**必须是类属性**：TCPServer.__init__ 里已经 listen() 过了，
+# 构造之后再改实例属性对已 listen 的套接字毫无作用（实测 Send-Q 恒为默认的 5）。
+SERVER_BACKLOG = 128
 
 # 预览结果缓存：避免每次动一个滑块就把整条流水线重跑一遍
 _CACHE: dict[tuple[str, str], dict] = {}
@@ -848,7 +858,10 @@ function renderPreview(j){
     pv.innerHTML = '';
     j.images.forEach(function(src, i){
       var img = document.createElement('img');
-      img.src = src; img.alt = '第 ' + (i + 1) + ' 张'; img.loading = 'lazy';
+      // 预览图 URL 是 /img?…，它同样在鉴权之后 —— 必须走 api() 补口令，
+      // 否则公网端口整片裂图（服务端虽然已经拼了一次，这里是第二道保险，
+      // 重复带同一个 t= 无害）。别改回 img.src = src。
+      img.src = api(src); img.alt = '第 ' + (i + 1) + ' 张'; img.loading = 'lazy';
       pv.appendChild(img);
     });
   }
@@ -1121,6 +1134,9 @@ class Handler(BaseHTTPRequestHandler):
     # 供 /admin 页面显示 TLS 现状
     tls_enabled: bool = False
     tls_port: int = 0
+    # 明文端口。贴纸上的「内网码」要靠它拼出 http://IP:PORT/，
+    # 所以启动时把 --port 存下来 —— 光有 host_display 只有 IP 没有端口。
+    http_port: int = 0
 
     # -------------------------------------------------------------- 工具
     def log_message(self, fmt, *args):
@@ -1251,9 +1267,10 @@ class Handler(BaseHTTPRequestHandler):
                           {"Cache-Control": "no-store"})
 
     # 管理页的动作白名单：只认这几个，避免把 Handler 的私有方法暴露成路由
-    _ADMIN_GETS = ("/admin/api/status",)
+    _ADMIN_GETS = ("/admin/api/status", "/admin/qr.svg")
     _ADMIN_POSTS = ("/admin/api/config", "/admin/api/verify",
-                    "/admin/api/ddns", "/admin/api/cert")
+                    "/admin/api/ddns", "/admin/api/cert",
+                    "/admin/api/sticker")
 
     def _admin_dispatch(self, path: str, is_post: bool):
         """
@@ -1316,14 +1333,134 @@ class Handler(BaseHTTPRequestHandler):
         tail = "?t=%s" % self.token if self.token else ""
         return "https://%s%s/%s" % (domain, port, tail)
 
+    def _sticker_avail(self) -> dict:
+        """
+        每种码当前能不能印 —— 值是一个 `(Code 或 None, 不可用的原因)`。
+
+        「不可用」在这里是**正常状态**而不是错误：没配域名就没有公网码，
+        没放 APK 就没有下载码。管理页把这几项灰掉并说明原因，总比印一张
+        扫出来是 404 的贴纸强。
+        """
+        host = pg_sticker.lan_ip() or self.host_display
+        port = self.http_port or 80
+        suffix = "" if port == 80 else ":%d" % port
+        base = "http://%s%s" % (host, suffix)
+        data = pg_admin.load_secrets()
+        wan = self._public_url(data)
+        has_apk = bool(self.apk_path) and os.path.exists(self.apk_path)
+        no_host = "探测不到本机局域网地址"
+
+        return {
+            "lan": ((pg_sticker.Code("lan", "同一 Wi-Fi",
+                                     "%s%s" % (host, suffix), base + "/"), "")
+                    if host else (None, no_host)),
+            "wan": ((pg_sticker.Code("wan", "任意网络",
+                                     pg_admin.full_domain(data) or "公网", wan), "")
+                    if wan else (None, "未启用 HTTPS 或未配域名")),
+            "app": ((pg_sticker.Code("app", "装 App", "扫码安装", base + "/app"), "")
+                    if (host and has_apk)
+                    else (None, no_host if not host
+                          else "未找到可下载的 APK（启动参数 --apk）")),
+        }
+
+    def _sticker_codes(self, kinds) -> tuple[list, list]:
+        """按 kind 列表取可用的码。返回 (Code 列表, 被跳过的 kind 列表)。"""
+        avail = self._sticker_avail()
+        codes, skipped = [], []
+        for kind in (kinds or list(pg_sticker.CODE_KINDS)):
+            code, _why = avail.get(kind, (None, "未知类型"))
+            (codes if code else skipped).append(code or kind)
+        return codes, skipped
+
+    def _admin_qr_svg(self):
+        """
+        管理页里的单码预览。
+
+        内容一律**由服务端按 kind 现算**，不接受前端传 URL —— 否则这就是
+        一个开在管理页后面的任意二维码生成接口了，没这个必要。
+        """
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        codes, _ = self._sticker_codes([(q.get("kind") or [""])[0]])
+        if not codes:
+            return self._err("这个二维码当前不可用", 404)
+        try:
+            svg = pg_sticker.svg_for(codes[0].url)
+        except pg_sticker.StickerError as exc:
+            return self._err(str(exc))
+        return self._send(200, svg.encode("utf-8"),
+                          "image/svg+xml; charset=utf-8",
+                          {"Cache-Control": "no-store"})
+
+    def _admin_sticker(self, payload: dict):
+        """
+        生成贴纸 PDF 并**注册成一个作业**，由前端带着 job id 跳进打印面板。
+
+        不直接送 CUPS 是刻意的：先落到面板上，用户能看到预览、能选打印机
+        和纸盒、能改份数 —— 这些能力面板里本来就有，没理由再实现一遍，
+        更没理由绕过它们把纸直接推出去。
+        """
+        # 注意别写成 `int(payload.get("layout") or 1)` —— 0 是 falsy，
+        # 会被悄悄换成 1，等于把非法参数当成没传。少传用默认，传错要报错。
+        raw = payload.get("layout")
+        if raw in (None, ""):
+            layout = 1
+        else:
+            try:
+                layout = int(raw)
+            except (TypeError, ValueError):
+                return self._err("版式参数不对")
+        if layout not in pg_sticker.LAYOUTS:
+            return self._err("不支持的版式：%s" % layout)
+
+        codes, skipped = self._sticker_codes(payload.get("kinds"))
+        if not codes:
+            reasons = self._sticker_avail()
+            why = "；".join(sorted({reasons[k][1] for k in pg_sticker.CODE_KINDS}))
+            return self._err("没有可用的二维码 —— %s" % why)
+
+        job = self.store.create()
+        target = os.path.join(job.dir, "source.pdf")
+        try:
+            pg_sticker.build_pdf(codes, target, layout=layout)
+            pages, sizes = pg_engine.pdf_info(target)
+        except (pg_sticker.StickerError, EngineError, OSError) as exc:
+            shutil.rmtree(job.dir, ignore_errors=True)
+            return self._err("贴纸生成失败：%s" % exc)
+
+        job.filename = "二维码贴纸（%s）.pdf" % _LAYOUT_LABEL.get(layout, layout)
+        job.source_pdf = target
+        job.pages = pages
+        job.files = 1
+        job.sizes = sizes
+        LOG.info("生成二维码贴纸 %s：%s，%d 联 -> 作业 %s",
+                 job.filename, "/".join(c.kind for c in codes), layout, job.id)
+        return self._json({"id": job.id, "filename": job.filename,
+                           "pages": pages, "files": 1,
+                           "codes": [c.kind for c in codes],
+                           "skipped": skipped,
+                           "booklet": booklet_summary(pages)})
+
     def _admin_action(self, path: str, is_post: bool):
         if path == "/admin/api/status":
             data = pg_admin.load_secrets()
             status = pg_admin.collect_status(data, self.tls_enabled, self.tls_port)
             status["public_url"] = self._public_url(data)
+            avail = self._sticker_avail()
+            status["sticker"] = {
+                kind: {"available": bool(code), "reason": why,
+                       "label": code.label if code else "",
+                       "sub": code.sub if code else "",
+                       "url": code.url if code else ""}
+                for kind, (code, why) in avail.items()
+            }
             return self._json(status)
 
+        if path == "/admin/qr.svg":
+            return self._admin_qr_svg()
+
         payload = self._json_body()
+        if path == "/admin/api/sticker":
+            return self._admin_sticker(payload)
         if path == "/admin/api/config":
             data = pg_admin.load_secrets()
             if payload.get("clear_credentials"):
@@ -1555,11 +1692,24 @@ class Handler(BaseHTTPRequestHandler):
         return entry
 
     def _preview_urls(self, job: Job, key: str, entry: dict) -> list[str]:
+        """
+        预览图的 URL 列表。
+
+        **口令直接拼进去** —— `/img` 在 `_authed()` 之后，公网端口不带口令就是
+        401，前端拿到一串裂图。以前这里只拼 job/k/n，前端那边 `<img src>` 又
+        忘了走 `api()`，于是「内网好好的、外网预览全裂」。
+
+        这里与前端 `api()` 是**双保险**：前端仍会用 api() 再补一次 t=，
+        重复带同一个值对 `_authed()`（取 parse_qs 的第一个值）完全无害；
+        直接消费这份 JSON 的客户端（含安卓 App 的 WebView）则不必自己拼。
+        """
         urls = []
+        tail = "&t=%s" % urllib.parse.quote(self.token, safe="") if self.token else ""
         for path in entry["images"]:
             m = re.search(r"(\d+)\.png$", path)
             if m:
-                urls.append("/img?job=%s&k=%s&n=%s" % (job.id, key, m.group(1)))
+                urls.append("/img?job=%s&k=%s&n=%s%s"
+                            % (job.id, key, m.group(1), tail))
         return urls
 
     def _api_job(self):
@@ -1647,7 +1797,28 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(200, data, "image/png", {"Cache-Control": "private, max-age=300"})
 
 
-class DualStackServer(ThreadingHTTPServer):
+class QueueHTTPServer(ThreadingHTTPServer):
+    """
+    带足够长监听队列的 HTTP 服务。
+
+    `request_queue_size` **必须是类属性**：`TCPServer.__init__` 内部走的是
+    `server_bind()` → `self.listen(self.request_queue_size)`，构造完成之后再赋值
+    就晚了 —— 实测那样写 Send-Q 一直是标准库默认的 5，多台手机同时上传会被拒。
+    """
+
+    request_queue_size = SERVER_BACKLOG
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        # 公网/手机侧连接被随手掐断是常态，别刷栈
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ssl.SSLError, ConnectionResetError, BrokenPipeError)):
+            LOG.debug("连接异常（%s）：%s", client_address[0], exc)
+            return
+        super().handle_error(request, client_address)
+
+
+class DualStackServer(QueueHTTPServer):
     """
     双栈监听：同一端口同时接受 IPv4 与 IPv6。
 
@@ -1658,7 +1829,6 @@ class DualStackServer(ThreadingHTTPServer):
     """
 
     address_family = socket.AF_INET6
-    daemon_threads = True
 
     def server_bind(self):
         try:
@@ -1671,20 +1841,57 @@ class DualStackServer(ThreadingHTTPServer):
         self.server_name = host or "::"
         self.server_port = port
 
-    def handle_error(self, request, client_address):
-        # TLS 端口常年被扫描器敲门，握手失败是常态，别刷栈
-        exc = sys.exc_info()[1]
-        if isinstance(exc, (ssl.SSLError, ConnectionResetError, BrokenPipeError)):
-            LOG.debug("TLS 连接异常（%s）：%s", client_address[0], exc)
-            return
-        super().handle_error(request, client_address)
 
-
-def wrap_tls(httpd: ThreadingHTTPServer, cert: str, key: str) -> None:
+class TLSHandshakeMixin:
     """
-    给**监听套接字**套 TLS：之后 accept 出来的连接在建立时即完成握手。
+    把 TLS 握手放到**每连接线程**里做，绝不在 accept 循环里做。
+
+    为什么非要这样：标准库 `SSLSocket.accept()` 的实现是「accept + 同步握手」，
+    而 `do_handshake_on_connect` 默认 True、又没有超时。于是只要把 TLS 套在
+    **监听套接字**上，一条「TCP 连上但不发 ClientHello」的连接（端口扫描器的
+    标准动作）就会把 `serve_forever()` 的 accept 循环**永久卡死**：
+    之后所有连接只能堆在 backlog 里，直到进程重启。现场特征很好认 ——
+    `ss -lnt` 的 Recv-Q 顶到 backlog 不归零，`ss -ntp` 里挂着一堆
+    CLOSE-WAIT 连接，Recv-Q 里躺着几百字节没被读走的 ClientHello。
+
+    2026-09-19 就是这样被 66.132.x.x / 115.231.x.x 的扫描器打死的：
+    DNAT、DNS、DDNS、证书全部正常，唯独 8443 连本机自己都连不上。
+    公网端口天天被扫，这不是「可能发生」而是「必然发生」。
+
+    改成下面这样之后：accept 循环永远只做 `accept()`，握手落在
+    ThreadingMixIn 已经起好的每连接线程里，并且有 TLS_HANDSHAKE_TIMEOUT 兜底 ——
+    扫描器再多也卡不住入口。
+    """
+
+    tls_context = None
+
+    def get_request(self):
+        # 只 accept，不握手；握手交给 process_request_thread
+        sock, addr = self.socket.accept()
+        return sock, addr
+
+    def process_request_thread(self, request, client_address):
+        # 这一段已经跑在每连接线程里（不是 accept 循环），卡住也不影响别人
+        try:
+            request.settimeout(TLS_HANDSHAKE_TIMEOUT)
+            tls = self.tls_context.wrap_socket(request, server_side=True)
+            tls.settimeout(None)           # 交回阻塞模式给后续读写
+        except (ssl.SSLError, OSError, ValueError) as exc:
+            # 扫描器握手失败是常态，静默丢弃即可。
+            # wrap_socket 失败时标准库已自行 close 过 fd（_create 里先
+            # sock.detach() 再握手），所以这里不会再关第二次、不会误关别人的连接。
+            LOG.debug("TLS 握手失败（%s）：%s", client_address[0], exc)
+            self.shutdown_request(request)
+            return
+        super().process_request_thread(tls, client_address)
+
+
+def make_tls_context(cert: str, key: str) -> ssl.SSLContext:
+    """
+    建 server 侧 TLS 上下文。
 
     只支持 TLS 1.2+（微信 WebView 与所有现代浏览器都没问题，老 Android 4.x 不行）。
+    这里**不碰监听套接字** —— 握手由 TLSHandshakeMixin 在每连接线程里做。
     """
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(cert, key)
@@ -1695,7 +1902,13 @@ def wrap_tls(httpd: ThreadingHTTPServer, cert: str, key: str) -> None:
         ctx.set_alpn_protocols(["http/1.1"])
     except NotImplementedError:
         pass
-    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+    return ctx
+
+
+def tls_server_class(dual_stack: bool) -> type:
+    """把 TLS 握手混入正确的监听基类（双栈 / 仅 IPv4）。"""
+    base = DualStackServer if dual_stack else QueueHTTPServer
+    return type("TLSServer", (TLSHandshakeMixin, base), {})
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1785,14 +1998,16 @@ def main(argv: list[str] | None = None) -> int:
         LOG.info("默认队列：%s%s", Handler.default_queue,
                  "（--printer 锁定）" if Handler.printer_locked else "（跟随 CUPS 默认）")
 
-    httpd = ThreadingHTTPServer((args.bind, args.port), Handler)
-    httpd.request_queue_size = 64          # 默认只有 5，多台手机同时上传会被拒
+    # 用 QueueHTTPServer 而不是裸的 ThreadingHTTPServer：backlog 得靠类属性才生效
+    # （见 SERVER_BACKLOG 的注释），默认的 5 在多台手机同时上传时会被拒。
+    httpd = QueueHTTPServer((args.bind, args.port), Handler)
     httpd.daemon_threads = True
     try:
         host = args.host_display or socket.gethostbyname(socket.gethostname())
     except OSError:
         host = args.host_display or args.bind
     Handler.host_display = host
+    Handler.http_port = args.port
     LOG.info("%s 已启动：http://%s:%d", args.title, host, args.port)
     LOG.info("上传上限 %d MB，预览 %d dpi，默认打印 %d dpi",
              MAX_UPLOAD_MB, pg_engine.PREVIEW_DPI, pg_engine.DEFAULT_DPI)
@@ -1819,15 +2034,13 @@ def main(argv: list[str] | None = None) -> int:
             LOG.warning("证书缺失（%s）—— %d 端口未启用；先在 /admin 里签发",
                         cert, args.tls_port)
         else:
-            server_cls = (DualStackServer if ":" in args.tls_bind
-                          else ThreadingHTTPServer)
+            server_cls = tls_server_class(":" in args.tls_bind)
             try:
                 tls_server = server_cls((args.tls_bind, args.tls_port), Handler)
-                tls_server.request_queue_size = 64
-                tls_server.daemon_threads = True
+                # 上下文必须在 serve_forever() 之前设好 —— 每连接线程要用它做握手
+                tls_server.tls_context = make_tls_context(cert, key)
                 # 标记：Handler 靠它判断「这是公网端口，必须校验口令」
                 tls_server.is_tls = True
-                wrap_tls(tls_server, cert, key)
             except (OSError, ssl.SSLError) as exc:
                 LOG.error("TLS 端口 %d 启动失败：%s", args.tls_port, exc)
                 return 2
@@ -1835,6 +2048,8 @@ def main(argv: list[str] | None = None) -> int:
             Handler.tls_port = args.tls_port
             LOG.info("HTTPS 已启用：https://%s:%d（证书 %s）",
                      args.tls_bind, args.tls_port, cert)
+            LOG.info("TLS 握手在每连接线程内完成（限时 %.0f 秒）——"
+                     "扫描器占不住 accept 循环", TLS_HANDSHAKE_TIMEOUT)
     if args.admin_token:
         LOG.info("管理页：http://%s:%d/admin （仅限内网）", host, args.port)
 

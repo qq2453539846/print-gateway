@@ -173,7 +173,7 @@ def match_drivers(info, extra_kw=None):
         "lexmark": ["lexmark"],
         "samsung": ["samsung"],
         "ricoh": ["ricoh"],
-        "Kyocera": ["Kyocera"],
+        "kyocera": ["kyocera"],
         "xerox": ["xerox"],
         "dell": ["dell"],
         "lenovo": ["lenovo"],

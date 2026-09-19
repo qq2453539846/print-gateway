@@ -285,7 +285,7 @@ class MainActivity : AppCompatActivity() {
         }
         AlertDialog.Builder(this)
             .setTitle(R.string.server_title)
-            .setMessage(R.string.server_msg)
+            .setMessage(getString(R.string.server_msg) + "\n\n" + buildLabel())
             .setView(box)
             .setCancelable(!first)
             .setPositiveButton(R.string.save_connect) { _, _ ->
@@ -308,6 +308,16 @@ class MainActivity : AppCompatActivity() {
     private fun launchScan() {
         startActivityForResult(Intent(this, ScanActivity::class.java), REQ_SCAN)
     }
+
+    /**
+     * 构建标识，显示在设置框里。
+     *
+     * 存在的理由很具体：2026-09-19 扫码一直报「不是有效的连接二维码」，
+     * 真正原因是**修复写进了源码但没重新构建**，手机上跑的还是旧包。
+     * 版本号看得见，这类问题就不需要靠猜。
+     */
+    private fun buildLabel(): String =
+        getString(R.string.app_build_fmt, BuildConfig.VERSION_NAME, BuildConfig.BUILD_STAMP)
 
     private fun loadHome() {
         // 配置了口令时，首页 URL 必须带 ?t= —— 否则开 --token 的服务会把
