@@ -357,16 +357,24 @@ python3 verify_e2e.py
 |---|---|---|
 | [CUPS](https://github.com/OpenPrinting/cups) | 打印系统本体：队列管理、作业调度、后端驱动 | Apache-2.0 |
 | [cups-filters](https://github.com/OpenPrinting/cups-filters) | `pdftopdf` 等 PDF 过滤器链 | GPL-2.0 |
+| [usbutils](https://github.com/gregkh/usbutils)（`lsusb`） | `setup_printer.py` 识别 USB 打印机：sysfs 分类不出「是不是打印机」时，读 USB 描述串兜底；也是体检报告的第一段 | GPL-2.0 |
+| [kmod](https://github.com/kmod-project/kmod)（`lsmod`）+ [util-linux](https://github.com/util-linux/util-linux)（`dmesg`） | 体检报告：`usblp` 模块有没有加载、内核认没认到这台打印机（只读诊断，读不到不影响功能） | LGPL-2.1 / GPL-2.0 |
 | [Ghostscript](https://www.ghostscript.com/) | PDF 解释、纸张/方向/灰度/缩放/镜像归一化、栅格化 | AGPL-3.0 |
 | [Poppler](https://poppler.freedesktop.org/)（poppler-utils） | `pdfseparate` / `pdfunite` 选页合并，`pdftoppm` 渲染预览 | GPL-2.0 |
 | [ReportLab](https://www.reportlab.com/opensource/) | 拼版 PDF 合成（把每版无损嵌入纸面） | BSD-3-Clause |
 | [Pillow](https://python-pillow.org/) | 栅格装饰层：水印、页码、页眉页脚、位图裁剪与合成 | MIT-CMU (HPND) |
 | [Python](https://www.python.org/) | 语言与运行时（`http.server`、`ssl`、`zlib`、`ipaddress` 等标准库） | PSF-2.0 |
 | [acme.sh](https://github.com/acmesh-official/acme.sh)（可选） | Let's Encrypt 证书签发与续期，含 DNSPod / 腾讯云 DNS 插件 | GPL-3.0 |
+| [OpenSSL](https://www.openssl.org/) | `openssl x509` 直读证书到期时间与主题，供 `/admin` 的证书状态显示（不依赖 acme.sh 内部状态文件） | Apache-2.0（3.x） |
 | [systemd](https://systemd.io/)（可选） | 服务托管与定时任务（DDNS、证书检查） | LGPL-2.1 |
 | [Noto Sans CJK](https://github.com/notofonts/noto-cjk)（`fonts-noto-cjk`） | 中文水印 / 页码 / 页眉页脚的字体 | SIL OFL-1.1 |
 
 证书由 [Let's Encrypt](https://letsencrypt.org/) 免费提供（服务，非代码）。
+
+**公网 IP 探测同理，也是第三方服务**：`pg_dns.py` 的 `WAN_SOURCES` 按「国内可达性」排序，
+依次向 `myip.ipip.net`、`ip.3322.net`、`4.ipw.cn`、`api.ipify.org` 四个公开接口 GET 一次
+（均无鉴权、限读 512 字节），前一个取不到才试下一个。这些接口的代码不在本仓库，也不受本项目
+许可约束；若你的环境不方便让请求外发，把 `WAN_SOURCES` 换成自建接口即可。
 
 **关于 AGPL 的 Ghostscript 会不会「传染」本项目**：不会。本项目通过**子进程**调用 `gs`
 命令行（`subprocess` + 参数列表），既不链接其库也不修改其代码，属于独立程序间的调用，
@@ -390,7 +398,7 @@ python3 verify_e2e.py
 > 如果你更希望全链路开源，可以换用 [ZXing](https://github.com/zxing/zxing)（Apache-2.0），
 > 代价是识别率与倾斜 / 模糊场景下的鲁棒性要自己调优。
 
-### 开发期与验证工具
+### 开发、部署与验证工具
 
 | 项目 | 用途 | 许可 |
 |---|---|---|
@@ -398,6 +406,8 @@ python3 verify_e2e.py
 | [zxing-cpp](https://github.com/zxing-cpp/zxing-cpp) | **仅用于验证**：`test_pg_sticker.py` 用它做真实解码回读，判定以它为准 | Apache-2.0 |
 | [OpenCV](https://opencv.org/) | **仅用于验证**：`verify_qr.py` 用真实解码器回读生成的二维码；`test_pg_sticker.py` 里作补充证据 | Apache-2.0 |
 | [NumPy](https://numpy.org/) | 同上，位图数组运算 | BSD-3-Clause |
+| [iproute2](https://github.com/iproute2/iproute2)（`ss`） | **仅用于验证**：`test_print_gateway.py` 真起监听后读回内核 `Send-Q`，证明 backlog 不是默认的 5（没装 `ss` 则该用例自动跳过） | GPL-2.0 |
+| [OpenSSH](https://www.openssh.com/)（`ssh` / `scp` 客户端） | 部署期：`deploy_gateway.py` 用 `scp` 上传文件、`ssh` 执行安装脚本（走你 `~/.ssh/config` 里的别名） | BSD（OpenSSH 自定义） |
 | [Paramiko](https://www.paramiko.org/) | 开发期 SSH 主机指纹采集脚本（未包含在本仓库） | LGPL-2.1 |
 
 > 本项目的二维码生成器（`gen_qr.py`）是**自研的纯标准库实现**，算法依据公开标准
