@@ -153,15 +153,42 @@ python deploy_gateway.py --host <别名> --port 8080 --token 你的口令
 仓库自带一个落盘后端，把「打印」变成往 `/tmp/gwtest` 写文件：
 
 ```bash
-# 部署时用它建一个测试队列
-lpadmin -p GW_TEST -E -v gwtest:/tmp/gwtest -m <任意 PPD>
+# 装后端（一次即可）
+install -m 700 test_backend/gwtest /usr/lib/cups/backend/gwtest
 
-# 打印结果落盘后，用 PDF 工具自行核对页数/尺寸/页序
+# 临时建队列 → 跑端到端 → 删队列
+python3 verify_e2e.py --setup --teardown
+```
+
+`verify_e2e.py` 用双标记定位法逐项核对页数、尺寸、页序位置、灰度、镜像、
+小册子配对、裁剪、分割映射、装饰与批量合并 —— 全部不需要真机。落盘产物
+也可以自己拿 PDF 工具看：
+
+```bash
 ls -l /tmp/gwtest
 ```
 
-配合 `verify_e2e.py` 可以逐项核对页数、尺寸、页序位置、灰度、镜像、
-小册子配对、裁剪、分割映射、装饰与批量合并 —— 全部不需要真机。
+#### ⚠️ 测试队列不要常驻
+
+手工建删是这两条，`-m raw` **不能省**：
+
+```bash
+lpadmin -p GW_TEST -E -v gwtest:/test -m raw    # 建
+lpadmin -x GW_TEST                              # 删
+```
+
+**为什么不能常驻**：CUPS 会把每个队列都做成 mDNS 实例（`GW_TEST @ <主机名>`），
+macOS / Windows 的自动发现列表里就会多出一条看不出区别的条目 —— 它的 TXT 是
+`ty=Unknown` / `product=Unknown`，这是唯一能分辨它的破绽。更麻烦的是**网关自己的
+网页面板也会列出它**（`list_printers()` 用 `lpstat -p -d` 抓全部队列，前端不过滤），
+手滑选中它，作业就落进 `/tmp/gwtest`：**CUPS 报成功、页数也对，就是物理不出纸**。
+
+**为什么 `-m raw` 不能省**：不带 PPD 时 CUPS 只搬运格式、不跑滤镜，落盘的 `.prn`
+才是排版引擎的真实产物。省了它，CUPS 会转去「尽力自动配驱动」，观测到的东西就
+不可信了 —— 测试等于没测。
+
+后端文件 `gwtest` 自己不广播、不进任何队列列表，留着零副作用。所以
+「**后端常驻、队列按需**」是这套组合里最省事的姿势。
 
 ### 4. 手机扫码
 
@@ -306,8 +333,11 @@ Ghostscript 的 `/BeginPage` 等页面钩子对**多页文档只对首页生效*
 python3 -m unittest test_pg_engine test_print_gateway test_gen_qr \
                      test_pg_dns test_pg_admin test_pg_ddns test_pg_sticker
 
-# 端到端（建议打到落盘队列，勿打真机）
-python3 verify_e2e.py
+# 端到端（打到落盘队列，勿打真机；--setup 建队列、--teardown 跑完删）
+python3 verify_e2e.py --setup --teardown
+
+# 只跑标题含某子串的用例（调试用）
+python3 verify_e2e.py --only 小册子
 ```
 
 | 文件 | 覆盖重点 |
@@ -319,7 +349,7 @@ python3 verify_e2e.py
 | `test_pg_admin.py` | 67 项：**掩码不会写成新值**、域名校验、内网判据 fail-closed、证书天数按 UTC 算、DDNS 只碰目标记录 |
 | `test_pg_ddns.py` | 14 项：未配置时安静跳过、失败返回非零、`--quiet` 透传 |
 | `test_gen_qr.py` | 23 项：矩阵与标准一致性、纠错等级、容量边界 |
-| `verify_e2e.py` | 设备端到端：双标记定位法逐项核对页数 / 尺寸 / 页序 / 灰度 / 镜像 / 小册子配对 / 裁剪 / 分割映射 / 装饰 / 批量 |
+| `verify_e2e.py` | 设备端到端：双标记定位法逐项核对页数 / 尺寸 / 页序 / 灰度 / 镜像 / 小册子配对 / 裁剪 / 分割映射 / 装饰 / 批量（`--setup` / `--teardown` 按需建删落盘队列，`--only` 跑子集） |
 | `verify_qr.py` | 用 OpenCV 真实解码生成的二维码（需 `opencv-python-headless`） |
 | `verify_qr_ref.py` | 与成熟参考库 `qrcode` 的输出**逐位比对**矩阵（需 `qrcode`） |
 | `verify_sticker.py` | 设备端贴纸出纸：`pdfinfo` 读回必须是 A4、编码必须是 CCITT G4（无损）、再用 ghostscript 渲一遍 |

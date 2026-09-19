@@ -17,7 +17,16 @@ verify_e2e.py —— 打印网关端到端验证（在设备上运行）
 3. 逐项断言：页数、纸张尺寸、灰度、栅格/矢量路径、页序位置、边距内缩、
    边框存在、镜像翻转。
 
-用法： python3 verify_e2e.py [--base http://127.0.0.1:8080] [--keep]
+用法
+----
+    python3 verify_e2e.py --setup --teardown     # 推荐：临时建队列，跑完删掉
+    python3 verify_e2e.py                        # 队列已存在时直接用
+    python3 verify_e2e.py --only 小册子          # 只跑标题含该子串的用例
+    python3 verify_e2e.py --keep                 # 保留临时目录便于复查
+
+`GW_TEST` 平时**不留在设备上** —— 它会被 CUPS 广播成 `GW_TEST @ <主机名>`，
+也出现在网关网页面板的队列下拉里（见 TEST_QUEUE 处的注释）。
+`--setup` 按需创建，`--teardown` 跑完清理。
 """
 
 import argparse
@@ -60,6 +69,54 @@ SKIPPED: list = []
 # ------------------------------------------------------------------ 基础工具
 def sh(cmd, timeout=180):
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+# ------------------------------------------------------------------ 落盘队列
+# GW_TEST 队列**平时不留在设备上**：它 Shared=Yes，会被 CUPS 广播成
+# `GW_TEST @ <主机名>`，同时出现在网关网页面板的队列下拉里
+# （list_printers() 用 `lpstat -p -d` 抓全部队列，前端不过滤）。
+# 用户手滑选中它，作业会落进 /tmp/gwtest：CUPS 报成功、页数也对，就是物理不出纸。
+# 所以改为「跑 E2E 时按需创建、跑完删掉」。后端文件 gwtest 本身不广播、不出现在
+# 任何列表里，留在设备上零副作用，下次建队列一条命令即可。
+TEST_QUEUE = "GW_TEST"
+TEST_BACKEND = "/usr/lib/cups/backend/gwtest"
+
+
+def has_test_queue() -> bool:
+    """落盘队列当前是否已注册。用 lpstat 直查，不依赖网关服务在跑。"""
+    return TEST_QUEUE in sh(["lpstat", "-v"], timeout=20).stdout
+
+
+def setup_test_queue() -> bool:
+    """按需创建落盘队列，返回是否可用。"""
+    if has_test_queue():
+        return True
+    if not os.path.exists(TEST_BACKEND):
+        print("落盘后端缺失：%s" % TEST_BACKEND)
+        print("  从开发机装：scp test_backend/gwtest <主机>:%s" % TEST_BACKEND)
+        print("  再执行：    chmod 700 %s" % TEST_BACKEND)
+        return False
+    # -m raw 必须带：不带 PPD，CUPS 才不跑滤镜，落盘的 .prn 就是引擎的真实产物。
+    # 漏了它会变成「尽力自动配驱动」的队列，观测到的东西就不可信了。
+    r = sh(["lpadmin", "-p", TEST_QUEUE, "-E", "-v", "gwtest:/test", "-m", "raw"],
+           timeout=60)
+    if r.returncode != 0:
+        print("创建 %s 失败：%s" % (TEST_QUEUE, (r.stderr or r.stdout).strip()[:200]))
+        return False
+    return has_test_queue()
+
+
+def teardown_test_queue() -> None:
+    """删除落盘队列；后端文件保留，供下次 --setup 重建。"""
+    if not has_test_queue():
+        return
+    r = sh(["lpadmin", "-x", TEST_QUEUE], timeout=60)
+    if r.returncode == 0:
+        print("已移除 %s 队列（后端 %s 保留，下次 --setup 重建）"
+              % (TEST_QUEUE, TEST_BACKEND), flush=True)
+    else:
+        print("移除 %s 失败：%s"
+              % (TEST_QUEUE, (r.stderr or r.stdout).strip()[:200]), flush=True)
 
 
 def url_open(req, timeout=600):
@@ -335,6 +392,10 @@ def main():
     ap.add_argument("--keep", action="store_true", help="保留临时目录")
     ap.add_argument("--only", default="",
                     help="只跑标题含该子串的用例（调试用，省去重跑全部）")
+    ap.add_argument("--setup", action="store_true",
+                    help="先创建 %s 落盘队列（需 lpadmin 权限）" % TEST_QUEUE)
+    ap.add_argument("--teardown", action="store_true",
+                    help="跑完删除 %s 队列，设备上不留痕迹" % TEST_QUEUE)
     args = ap.parse_args()
 
     shutil.rmtree(WORK, ignore_errors=True)
@@ -348,11 +409,20 @@ def main():
         print("服务不可达：%r" % (exc,))
         return 2
 
+    if args.setup and not setup_test_queue():
+        return 2
+
     printers = url_open(urllib.request.Request(args.base + "/api/printers"))
     names = [p["name"] for p in printers.get("printers", [])]
     print("可用队列:", names, flush=True)
-    if "GW_TEST" not in names:
-        print("缺少 GW_TEST 落盘队列，无法验证")
+    if TEST_QUEUE not in names:
+        print("缺少 %s 落盘队列，无法验证。二选一：" % TEST_QUEUE)
+        print("  本脚本自动建：python3 verify_e2e.py --setup --teardown")
+        print("  手工建（设备上）：lpadmin -p %s -E -v gwtest:/test" % TEST_QUEUE)
+        if not os.path.exists(TEST_BACKEND):
+            print("  注意：后端 %s 不存在，需先装 test_backend/gwtest" % TEST_BACKEND)
+        if args.teardown:
+            teardown_test_queue()        # 别把刚建好的队列留成孤儿
         return 2
 
     # 生成源文件并上传
@@ -771,6 +841,8 @@ def main():
 
     if not args.keep:
         shutil.rmtree(WORK, ignore_errors=True)
+    if args.teardown:
+        teardown_test_queue()
     return 0 if not FAIL else 1
 
 
