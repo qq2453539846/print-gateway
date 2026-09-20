@@ -421,8 +421,52 @@ python3 print_gateway.py --port 8081 --token <口令> \
 ```
 
 `--public-url` 与 `--tls-port` 是**同一条铁律的两种形态**：只要公网可达就必须有口令，
-配了它却漏了 `--token` 会**直接拒绝启动**。配上之后，管理页的「公网链接」与二维码贴纸的
-「公网码」都会指向这个地址；漏配 `ADMIN_TOKEN` 时启动日志也会明确告警。
+配了它却漏了 `--token` 会**直接拒绝启动**。漏配 `ADMIN_TOKEN` 时启动日志也会明确告警。
+
+#### ⚠️ 公网实例的管理页不能开 —— 公网码改用命令行出
+
+这是穿透部署最容易踩的一处，值得单独说清。`--public-url` 算出来的公网码
+**只在管理页里露面**（`/admin` 的「公网链接」、贴纸上的「公网码」），
+而管理页的第一道关判的是**源 IP**：
+
+```python
+if not pg_admin.is_lan_addr(self.client_address[0]):   # 公网来源 → 404
+```
+
+隧道客户端偏偏就和网关跑在同一台设备的局域网里 —— 它转发过来的请求，
+源 IP 是内网地址。所以这道关会被**反向**绕过：一旦给公网实例配上
+`--admin-token`，管理页就真的对全网开放了，只剩口令一层。
+
+结论：**公网实例不要设 `--admin-token`**。代价是管理页关着，界面里出不了公网码 ——
+于是用命令行把这件事补上。`server/make_sticker.py` 与网关**共用同一套 URL 拼法**
+（有单元测试逐字符对拍，防止两边分头演化），但不经过 HTTP、不查源 IP、不比对口令：
+
+```bash
+# 出三张码（内网 / 公网 / App），公网码里嵌好口令
+python3 make_sticker.py --host 192.168.1.110 --port 8080 \
+        --public-url https://你拿到的地址 --token <口令> \
+        --out sticker-A4.pdf --png sticker-A4.png
+
+# 换域名、轮换口令之后重出一张，还是这一条命令
+python3 make_sticker.py --host 192.168.1.110 --public-url https://新地址 \
+        --token <新口令> --layout 4 --out sticker-4up.pdf
+```
+
+| 参数 | 说明 |
+|---|---|
+| `--host` / `--port` | 局域网地址与端口；不写 `--host` 就自动探测本机地址 |
+| `--public-url` / `--token` | 公网入口与口令；**给了 `--public-url` 就必须给 `--token`** |
+| `--wan` | 直接给出完整公网链接，优先级高于 `--public-url` |
+| `--kinds` | 要出哪些码，逗号分隔（默认 `lan,wan,app`） |
+| `--layout` | 一页印几张同样的贴纸：1 / 2 / 4（默认 1） |
+| `--out` / `--png` | PDF 与可选 PNG 预览 |
+| `--dry-run` | 只打印拼出来的链接，不落盘 —— 核对 URL 用 |
+
+不给 `--public-url` 就只出内网与 App 两张码，并打印跳过原因，与三码可用性在
+管理页里的表现一致。公网链接若写成明文 `http://` 却带着口令，会被**拒绝**：
+口令会交给链路上每个节点。确实要这么干得显式加 `--allow-insecure`。
+
+> 贴纸里嵌着口令，**别提交进仓库**。
 
 #### 穿透服务自身的两个限制
 
@@ -479,9 +523,10 @@ python3 print_gateway.py --port 8081 --token <口令> \
 ## 测试
 
 ```bash
-# 单元测试（444 项）
+# 单元测试（475 项）
 python3 -m unittest test_pg_engine test_print_gateway test_gen_qr \
-                     test_pg_dns test_pg_admin test_pg_ddns test_pg_sticker
+                     test_pg_dns test_pg_admin test_pg_ddns test_pg_sticker \
+                     test_make_sticker
 
 # 端到端（打到落盘队列，勿打真机；--setup 建队列、--teardown 跑完删）
 python3 verify_e2e.py --setup --teardown
@@ -493,12 +538,13 @@ python3 verify_e2e.py --only 小册子
 | 文件 | 覆盖重点 |
 |---|---|
 | `test_pg_engine.py` | 108 项：注入防护、裁剪/分割/装饰规范化、**预览档不改变版面**、**小册子纸型与双面档位由几何决定** |
-| `test_print_gateway.py` | 157 项：合并 PDF、上传上限、multipart 解析、小册子摘要、**预览档与出纸档分槽**、**管理页三道关**、**口令作用范围**、**贴纸生成与三码可用性** |
+| `test_print_gateway.py` | 174 项：合并 PDF、上传上限、multipart 解析、小册子摘要、**预览档与出纸档分槽**、**管理页三道关**、**口令作用范围**、**贴纸生成与三码可用性**、**`--public-url` 必须真的启用到鉴权上** |
 | `test_pg_sticker.py` | 25 项：版式几何、模块边长取整、**按 marks 逐模块回读比对**、**真实解码器回读**、无中文/坏版式的明确报错 |
 | `test_pg_dns.py` | 33 项：公网 / CGNAT 判定、多源兜底、两套 API 读写语义、**「值没变就不发写请求」**、TC3 签名独立复算 |
 | `test_pg_admin.py` | 67 项：**掩码不会写成新值**、域名校验、内网判据 fail-closed、证书天数按 UTC 算、DDNS 只碰目标记录 |
 | `test_pg_ddns.py` | 14 项：未配置时安静跳过、失败返回非零、`--quiet` 透传 |
 | `test_gen_qr.py` | 23 项：矩阵与标准一致性、纠错等级、容量边界 |
+| `test_make_sticker.py` | 31 项：**命令行与管理页的公网链接逐字符对拍**（两边分头演化就会印出两张不一样的贴纸）、码类型筛选、明文公网码带口令必须拦下 |
 | `verify_e2e.py` | 设备端到端：双标记定位法逐项核对页数 / 尺寸 / 页序 / 灰度 / 镜像 / 小册子配对 / 裁剪 / 分割映射 / 装饰 / 批量（`--setup` / `--teardown` 按需建删落盘队列，`--only` 跑子集） |
 | `verify_qr.py` | 用 OpenCV 真实解码生成的二维码（需 `opencv-python-headless`） |
 | `verify_qr_ref.py` | 与成熟参考库 `qrcode` 的输出**逐位比对**矩阵（需 `qrcode`） |

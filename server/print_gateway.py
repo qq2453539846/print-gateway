@@ -64,7 +64,7 @@ MAX_UPLOAD_MB = 50
 MAX_FILES = 10
 # 界面版本号（显示在页面右上角）。改动前端时一并递增 ——
 # 用户报「怎么改了没生效」时，第一件事就是看他看到的是哪个版本。
-VERSION = "v3.11.1 0920"
+VERSION = "v3.11.2 0920"
 # 二维码贴纸的版式名（一页印几张）
 _LAYOUT_LABEL = {1: "整页 1 张", 2: "A5 两张", 4: "A6 四张"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".webp"}
