@@ -7,7 +7,7 @@
 Android App 同理：扫码页与设置框都显示 `App <版本> · 构建 <时间戳>`，
 就是为了不再靠「感觉还是不行」来回猜装没装上。
 
-## [v3.11] — Docker 部署、界面截图与样例文件修复
+## [v3.11] — Docker 部署、内网穿透支持、界面截图与样例文件修复
 
 ### 新增
 
@@ -17,6 +17,13 @@ Android App 同理：扫码页与设置框都显示 `App <版本> · 构建 <时
   `entrypoint.sh` 起来之前先跑 `cupsd -t` 做配置语法自检 —— 配置写错的表现是
   「队列在、但打不出来」，比直接退出难查得多
 - README 补界面截图，落在 `docs/screenshots/`
+- **`--public-url`：支持「TLS 在别处终结」的部署**（第三方内网穿透 / 反向代理，如 DDNSTO）。
+  这类部署下网关自己跑明文、TLS 由隧道边缘终结，而原先的公网链接生成被绑死在
+  `tls_enabled and tls_port` 上，结果是**公网码永远为空、管理页那一项恒灰**。
+  新增参数把「公网链接」与「本机 TLS 端口」解耦，两者都能给出公网链接。
+  与 `--tls-port` 共用同一条铁律：**公网可达就必须有 `--token`，否则拒绝启动**
+  （判据是「这条链接公网可达吗」，不是「TLS 装在谁的机器上」）。
+  启动时还会就 `/admin` 的风险主动告警 —— 见下面的「修复」
 - **`app/build.sh`** —— `app/README` 一直在讲 `bash build.sh`，仓库里却没有这个文件。
   补上，且**不含硬编码路径**：SDK 取 `ANDROID_HOME` 或 `local.properties`，
   Gradle 优先用 wrapper。顺带处理 MSYS 路径 —— `/c/Users/x` 交给原生 `java.exe`
@@ -30,7 +37,7 @@ Android App 同理：扫码页与设置框都显示 `App <版本> · 构建 <时
   网关的归一化保护（页数变化即拒）立刻把预览挡成 400。
   这条恰好堵死了 README 里「没有实体打印机也能试」的那条路。
   修掉后实测：3 页过 gs 仍是 3 页，且不再出现 repair 告警
-- README 概览表的「单元测试 364 项」是旧数字，实跑为 **427 项**
+- README 概览表的「单元测试 364 项」是旧数字，实跑为 **440 项**
 - **compose 默认映射 `631:631`，在「宿主已装 CUPS」的机器上开箱即失败**。
   实测报 `Error starting userland proxy: bind: address already in use` —— 而
   「宿主有 CUPS」偏偏是本项目最常见的场景（网关本来就是包着 CUPS 的）。
@@ -45,11 +52,24 @@ Android App 同理：扫码页与设置框都显示 `App <版本> · 构建 <时
   `ENTRYPOINT ["/opt/gateway/entrypoint.sh"]` 直接起不来，报
   `sh: 1: /opt/gateway/entrypoint.sh: not found` —— 报错与换行符看不出关联。
   同容器内对照实测：CRLF 脚本 `not found`，LF 脚本正常。同一条也保护 `app/build.sh`
+- **内网穿透会让 `/admin` 的「仅限内网」判据失效，而且是「反向」失效**。
+  判据是 `pg_admin.is_lan_addr(client_address[0])`，其注释写明前提：
+  「DNAT 不改源 IP，所以从公网进来的手机在服务端看到的是它自己的公网地址」。
+  但穿透客户端**就运行在局域网内**，公网请求抵达网关时源 IP 成了内网地址 ⇒ 判为内网 ⇒
+  管理页从公网可达，原本「内网 + 有口令 + 口令校验」三道关只剩一道。
+  代码里没有任何 `X-Forwarded-For` 处理，所以不是误判成外网，是**反向**被绕过 ——
+  这类问题比误判更难自查。处置：写进 README，同时在启动日志里主动告警
+  （配了 `--public-url` 又配了 `--admin-token` 时明确提示公网实例不要开管理页）
 
 ### 验证
 
-- 服务端单元测试实跑 427 项全绿，分项 108 / 157 / 23 / 33 / 67 / 14 / 25
+- 服务端单元测试实跑 **440 项**全绿，分项 108 / 170 / 23 / 33 / 67 / 14 / 25
 - App `PrefsTest` 20 项全绿（`assembleRelease testDebugUnitTest`）
+- **内网穿透链路实机验证**（dev-10）：`--public-url` 配了却漏 `--token` → 退出码 **2**
+  （硬拒绝，且报错指向具体缺哪个参数）；只填 `gw.ddnsto.com` 会自动补成
+  `https://gw.ddnsto.com`；本机 `tls.enabled=false`（即没开 TLS）时
+  `/admin/api/status` 仍返回该公网链接，二维码贴纸的**「公网码」由 `available=false`
+  变为 `true` 且 URL 指向隧道域名** —— 解耦确实生效，这正是原先印不出来的那一项
 - **Docker 镜像实机构建 + 容器实跑**（armv7 设备，Amlogic S805 / Armbian）：
   镜像 331MB；容器起来后 `entrypoint.sh` 的 `cupsd -t` 自检通过、容器内 cupsd
   `scheduler is running`；`/healthz` 返回 200；容器内依次实测

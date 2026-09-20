@@ -24,6 +24,11 @@ TLS 与公网
 `--tls-port` 指定时才开 TLS 监听（证书缺失则不监听、只告警）；明文端口与 TLS 端口
 可以并存 —— 内网继续走 8080 明文扫码即用，公网走 8443 TLS。
 **启用 TLS 端口时强制要求 `--token`**：宁可拒绝启动，也不允许出现「公网免密打印」。
+
+`--public-url` 给「TLS 在**别处**终结」的部署用（第三方内网穿透 / 反向代理，如 DDNSTO）：
+此时本机不开 TLS，但公网链接仍然存在，二维码贴纸上的「公网码」要指向隧道域名。
+**它同样强制要求 `--token`** —— 判据是「这条链接公网可达吗」，而不是
+「TLS 在谁的机器上终结」。
 """
 
 from __future__ import annotations
@@ -1134,6 +1139,10 @@ class Handler(BaseHTTPRequestHandler):
     # 供 /admin 页面显示 TLS 现状
     tls_enabled: bool = False
     tls_port: int = 0
+    # 外部可达的完整基地址（--public-url）。给「TLS 在别处终结」的部署用
+    # （第三方内网穿透 / 反向代理）—— 这类部署下 tls_enabled 恒为 False，
+    # 公网链接只能由这里给出，否则公网码永远是空的。
+    public_url_override: str = ""
     # 明文端口。贴纸上的「内网码」要靠它拼出 http://IP:PORT/，
     # 所以启动时把 --port 存下来 —— 光有 host_display 只有 IP 没有端口。
     http_port: int = 0
@@ -1320,12 +1329,25 @@ class Handler(BaseHTTPRequestHandler):
 
     def _public_url(self, data: dict) -> str:
         """
-        公网访问链接（含口令）。只有在 TLS 端口真的起来了才生成 ——
-        否则给出一个打不开的链接，还不如不给。
+        公网访问链接（含口令）。
+
+        两个来源，`--public-url` 优先：
+
+        1. **显式给出**（`--public-url`）—— 给 TLS 在**别处**终结的部署用：
+           第三方内网穿透（DDNSTO 等）或反向代理。这种部署下网关自己不开 TLS，
+           所以**不能**再拿 `tls_enabled` 当判据，否则公网码永远为空、
+           管理页那一项永远是灰的。
+        2. **按域名 + 本机 TLS 端口自动拼** —— 只有 TLS 真起来了才生成，
+           否则给出一个打不开的链接，还不如不给。
 
         这个值只发给**已通过 admin 鉴权**的会话：用户本来就有权知道自己的口令，
         但要他手工拼一条 40 字符的 URL 未免太不讲道理。
         """
+        override = (self.public_url_override or "").strip().rstrip("/")
+        if override:
+            tail = "?t=%s" % self.token if self.token else ""
+            return "%s/%s" % (override, tail)
+
         domain = pg_admin.full_domain(data)
         if not (domain and self.tls_enabled and self.tls_port):
             return ""
@@ -1941,6 +1963,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="证书链路径，默认 %s" % pg_admin.cert_paths()["crt"])
     ap.add_argument("--tls-key", default="",
                     help="私钥路径，默认 %s" % pg_admin.cert_paths()["key"])
+    ap.add_argument("--public-url", default="",
+                    help="外部可达的完整基地址，如 https://xxx.ddnsto.com。"
+                         "给「TLS 在别处终结」的部署用（第三方内网穿透 / 反向代理）："
+                         "本机不开 TLS，但公网码要指向隧道域名。配了它必须同时配 --token")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -2017,6 +2043,32 @@ def main(argv: list[str] | None = None) -> int:
         LOG.warning("明文端口 %d 免密（内网扫码即用）—— "
                     "前提是它**不做 DNAT**；映射到公网即等于公网免密",
                     args.port)
+
+    # ------------------------------------------------- 公网链接（隧道/反代）
+    # 判据是「这条链接公网可达吗」，而不是「TLS 在谁的机器上终结」。
+    # 内网穿透（DDNSTO 等）把 TLS 放在边缘，网关自己跑明文，但公网链接照样成立，
+    # 所以这里必须和 --tls-port 那条一样硬：宁可拒绝启动，也不出现公网免密。
+    if args.public_url:
+        if not args.token:
+            LOG.error("指定 --public-url 时必须同时设置 --token"
+                      "（公网可达的链接不允许免密）")
+            return 2
+        if "://" not in args.public_url:
+            args.public_url = "https://" + args.public_url
+            LOG.warning("--public-url 未写协议，按 https 处理：%s", args.public_url)
+        Handler.public_url_override = args.public_url.strip().rstrip("/")
+        LOG.info("公网链接来自 --public-url：%s（不再依赖本机 TLS 端口）",
+                 Handler.public_url_override)
+        if args.tls_port:
+            LOG.info("同时开着 --tls-port %d：两条链接都成立，公网码以 "
+                     "--public-url 为准", args.tls_port)
+        if args.admin_token:
+            # 这是隧道部署最容易忽略的一处：/admin 的「仅限内网」判的是源 IP，
+            # 前提是「公网进来的源 IP 是公网地址」。穿透客户端就站在局域网里，
+            # 于是公网请求的源 IP 是内网地址 → 这道关被**反向**绕过，只剩口令一道。
+            LOG.warning("公网实例启用了 /admin：经内网穿透访问时源 IP 是隧道客户端的"
+                        "内网地址，「仅限内网」判据会失效，管理页只剩口令一层保护 —— "
+                        "公网实例建议不要设 --admin-token")
 
     # ---------------------------------------------------------- TLS 监听
     # 证书缺失**只告警不退出**：内网明文那条路照常工作，不能因为「还没签证书」

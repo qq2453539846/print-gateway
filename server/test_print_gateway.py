@@ -1037,6 +1037,47 @@ class TestDualStackSockets(unittest.TestCase):
                 self.fail("%s 连不上双栈监听：%s" % (addr, exc))
 
 
+class TestPublicUrlWiring(unittest.TestCase):
+    """
+    `--public-url` 的启动接线。
+
+    核心判据：**公网可达就必须有口令** —— 与 `--tls-port` 是同一条铁律的两种形态。
+    隧道把 TLS 挪到了边缘，但「公网免密」的性质一点没变。
+    """
+
+    def test_main_wires_public_url_arg(self):
+        import inspect
+        self.assertIn("--public-url", inspect.getsource(pg.main))
+
+    def test_main_refuses_public_url_without_token(self):
+        import inspect
+        src = inspect.getsource(pg.main)
+        idx = src.index("指定 --public-url 时必须同时设置 --token")
+        # 拒绝的那段里必须有非零退出，而不是「先开着再说」
+        self.assertIn("return 2", src[idx: idx + 200])
+
+    def test_bare_host_gets_https_scheme(self):
+        """用户常只填域名 —— 得补协议，否则拼出来的是个相对路径。"""
+        import inspect
+        self.assertIn('"https://" + args.public_url',
+                      inspect.getsource(pg.main))
+
+    def test_warns_admin_is_exposed_through_tunnel(self):
+        """
+        隧道客户端就在局域网内 ⇒ /admin 的「仅限内网」判据会被**反向**绕过
+        （判的是源 IP 是否私网，而源 IP 恰好是私网）。这一点必须在启动日志里
+        说出来，否则用户会以为三道关还在。
+        """
+        import inspect
+        src = inspect.getsource(pg.main)
+        self.assertIn("建议不要设 --admin-token", src)
+
+    def test_override_is_assigned_to_handler(self):
+        import inspect
+        self.assertIn("Handler.public_url_override = args.public_url",
+                      inspect.getsource(pg.main))
+
+
 def _self_signed_cert(tmpdir):
     """用 openssl 现造一张自签证书。没有 openssl 就返回 None（测试自动跳过）。"""
     exe = shutil.which("openssl")
@@ -1289,6 +1330,58 @@ class TestPublicUrl(unittest.TestCase):
     def test_no_token_means_no_query(self):
         self.assertEqual(self._h(token="")._public_url(self._data()),
                          "https://print.example.com:8443/")
+
+    # ---------------------------------------------------------- 隧道 / 反代
+    # --public-url：TLS 在别处终结（DDNSTO 等内网穿透、反向代理）。
+    # 这种部署下网关自己不开 TLS，若仍拿 tls_enabled 当判据，公网码永远是空的。
+
+    def test_override_works_without_local_tls(self):
+        h = self._h(tls_enabled=False, tls_port=0)
+        h.public_url_override = "https://gw.ddnsto.com"
+        self.assertEqual(h._public_url(self._data()),
+                         "https://gw.ddnsto.com/?t=abc123")
+
+    def test_override_needs_no_domain(self):
+        """隧道不依赖 DNS-01，本来就可以没有域名配置 —— 不能因此不给链接。"""
+        h = self._h(tls_enabled=False, tls_port=0)
+        h.public_url_override = "https://gw.ddnsto.com"
+        self.assertEqual(h._public_url(self._data(root="", sub="")),
+                         "https://gw.ddnsto.com/?t=abc123")
+
+    def test_override_strips_trailing_slash(self):
+        """用户常带尾斜杠填，不能拼出 //?t= 这种双斜杠。"""
+        h = self._h(tls_enabled=False, tls_port=0)
+        h.public_url_override = "https://gw.ddnsto.com/"
+        self.assertEqual(h._public_url(self._data()),
+                         "https://gw.ddnsto.com/?t=abc123")
+
+    def test_override_ignores_surrounding_spaces(self):
+        h = self._h(tls_enabled=False, tls_port=0)
+        h.public_url_override = "  https://gw.ddnsto.com  "
+        self.assertEqual(h._public_url(self._data()),
+                         "https://gw.ddnsto.com/?t=abc123")
+
+    def test_override_without_token_gives_bare_url(self):
+        h = self._h(tls_enabled=False, tls_port=0, token="")
+        h.public_url_override = "https://gw.ddnsto.com"
+        self.assertEqual(h._public_url(self._data()), "https://gw.ddnsto.com/")
+
+    def test_override_takes_precedence_over_tls(self):
+        """两者同时配时以 --public-url 为准（它是「公网码」指向的那个入口）。"""
+        h = self._h(tls_enabled=True, tls_port=8443)
+        h.public_url_override = "https://gw.ddnsto.com"
+        self.assertEqual(h._public_url(self._data()),
+                         "https://gw.ddnsto.com/?t=abc123")
+
+    def test_empty_override_keeps_auto_behaviour(self):
+        """不配 --public-url 时行为必须与改动前完全一致。"""
+        h = self._h(tls_enabled=True, tls_port=8443)
+        h.public_url_override = ""
+        self.assertEqual(h._public_url(self._data()),
+                         "https://print.example.com:8443/?t=abc123")
+
+    def test_handler_default_override_is_empty(self):
+        self.assertEqual(pg.Handler.public_url_override, "")
 
     def test_status_payload_carries_it(self):
         import inspect

@@ -81,6 +81,8 @@ if [ -n "${DEFAULT_DPI:-}" ]; then set -- "$@" --default-dpi "$DEFAULT_DPI"; fi
 if [ -n "${TLS_PORT:-}" ]; then set -- "$@" --tls-port "$TLS_PORT"; fi
 if [ -n "${TLS_CERT:-}" ]; then set -- "$@" --tls-cert "$TLS_CERT"; fi
 if [ -n "${TLS_KEY:-}" ]; then set -- "$@" --tls-key "$TLS_KEY"; fi
+# 内网穿透 / 反向代理部署：TLS 在隧道边缘终结，这里只声明公网入口地址
+if [ -n "${PUBLIC_URL:-}" ]; then set -- "$@" --public-url "$PUBLIC_URL"; fi
 if [ "${TOKEN_ALWAYS:-}" = "1" ]; then set -- "$@" --token-always; fi
 if [ "${VERBOSE:-}" = "1" ]; then set -- "$@" --verbose; fi
 
