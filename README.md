@@ -3,7 +3,7 @@
 自建的局域网自助打印服务：**手机扫码 → 上传文件 → 在网页里调好版面 → 从打印机出纸**。
 
 排版引擎全部跑在网关侧（一台 1GB 内存的 armv7 小盒子上），网页只负责采集设置与显示预览。
-打印面板对齐 WPS「打印预览」的操作习惯，但**所见即所得是真的** —— 预览与出纸走同一条流水线，
+打印面板沿用常见办公软件「打印预览」的操作习惯，但**所见即所得是真的** —— 预览与出纸走同一条流水线，
 只差构建分辨率。
 
 配套一个安卓 App：WebView 壳 + 相机扫码连接 + 「打开方式」直接打印。
@@ -24,17 +24,22 @@
 
 ---
 
-## ⚠️ 使用限制：不得用于商用
+## 许可
 
-本项目以 [CC BY-NC 4.0](LICENSE) 许可发布：**仅限非商业用途**（个人自用、学习、开源贡献）。
+本项目以 **Apache License 2.0** 发布，全文见 [LICENSE](LICENSE)。
 
-**禁止**将本代码或其衍生品用于：
+Copyright 2026 qq2453539846
 
-- 收费打印服务、共享打印、共享充电宝式的商业投放
-- 企业经营性用途，或嵌入任何商业化产品 / 服务
-- 以本代码为基础提供有偿技术支持、代部署、代运维
+概括（**以 LICENSE 原文为准**）：
 
-商业使用请自行取得作者许可。
+- **可以使用**于商业与非商业目的，包括修改、分发、再许可；
+- **需要**保留版权与许可声明，并标明你改动过的文件；
+- **不得**使用作者名义或商标为你的衍生品背书；
+- 含明确的**专利授权**条款 —— 提交者对其贡献授予专利许可，这也是它比宽松版权协议
+  更适合企业环境的原因。
+
+> 早先版本曾用 CC BY-NC 4.0，已弃用：Creative Commons 官方不建议把 CC 协议用于软件
+> （没有专利条款、不区分源码与目标码），且 NC 条款不符合 OSI 的开源定义。
 
 ---
 
@@ -133,7 +138,7 @@ server/            服务端（Python 3，HTTP 服务仅标准库）
   test_backend/      测试用 CUPS 后端，把任务落盘而不真印（无需实体打印机）
   test_*.py          单元测试；verify_*.py 验证脚本
 
-app/               安卓自助打印 App（Kotlin + CameraX + ML Kit）
+app/               安卓自助打印 App（Kotlin + CameraX + ZXing）
   WebView 壳 / 相机扫码连接 / 「打开方式」接收 PDF 与图片
 
 docs/screenshots/  README 用的界面截图
@@ -604,13 +609,13 @@ python3 verify_e2e.py --only 小册子
 
 **关于 AGPL 的 Ghostscript 会不会「传染」本项目**：不会。本项目通过**子进程**调用 `gs`
 命令行（`subprocess` + 参数列表），既不链接其库也不修改其代码，属于独立程序间的调用，
-因此本项目仍可沿用 CC BY-NC 4.0。反过来，ReportLab（BSD）与 Pillow（MIT-CMU）虽然是被
+因此本项目按 Apache-2.0 分发不受影响。反过来，ReportLab（BSD）与 Pillow（MIT-CMU）虽然是被
 `import` 的库，但两者都是宽松许可，允许被更严格的许可再分发 —— 唯一要守的是保留其版权声明。
 
 ### Android 端
 
 预编译包在 [Releases](https://github.com/qq2453539846/print-gateway/releases/latest)
-下载（`print-gateway-1.1.apk`），装上扫管理页的连接码即可用；自行构建见 `app/build.sh`。
+下载（`print-gateway-1.2.apk`），装上扫管理页的连接码即可用；自行构建见 `app/build.sh`。
 
 | 项目 | 用途 | 许可 |
 |---|---|---|
@@ -619,13 +624,11 @@ python3 verify_e2e.py --only 小册子
 | [CameraX](https://developer.android.com/media/camera/camerax) | 扫码预览（camera2 / lifecycle / view） | Apache-2.0 |
 | [Gradle](https://gradle.org/) + [Android Gradle Plugin](https://developer.android.com/build) | 构建系统 | Apache-2.0 |
 | [JUnit 4](https://junit.org/junit4/) | Prefs 连接码解析的纯函数单测 | EPL-1.0 |
-| **ML Kit Barcode Scanning** | 离线条码识别（扫码连接） | **免费但非开源**（Google 专有 SDK） |
+| [ZXing](https://github.com/zxing/zxing) | 离线条码识别（扫码连接），纯 Java 实现，无原生库 | Apache-2.0 |
 
-> **关于 ML Kit**：它是 Google 提供的**闭源免费** SDK，不是开源项目，使用需遵守
-> Google 的开发者条款（Google APIs Terms of Service 与 ML Kit 相关条款）。
-> 本项目的 CC BY-NC 4.0 只覆盖本项目自己的代码，**不覆盖 ML Kit**。
-> 如果你更希望全链路开源，可以换用 [ZXing](https://github.com/zxing/zxing)（Apache-2.0），
-> 代价是识别率与倾斜 / 模糊场景下的鲁棒性要自己调优。
+> **依赖树是干净的**：扫码识别用 ZXing 的 `core`，与 AndroidX / Kotlin 同属 Apache-2.0。
+> 早先用过 Google 的 ML Kit —— 那是闭源专有 SDK、另受 Google 开发者条款约束；
+> 为了整个依赖树都能对上开源许可（也为了少一份合规负担），已整体换成 ZXing。
 
 ### 开发、部署与验证工具
 
@@ -668,6 +671,6 @@ python3 verify_e2e.py --only 小册子
 
 ## 许可
 
-- 代码许可：**CC BY-NC 4.0（仅限非商业用途）**，详见 [LICENSE](LICENSE)
-- 保留许可声明与署名：`Copyright (c) 2026 print-gateway authors`
+- 代码许可：**Apache License 2.0**，详见 [LICENSE](LICENSE)
+- 版权与署名：`Copyright 2026 qq2453539846`
 - 再分发时请一并保留本 README 的致谢章节与第三方许可说明

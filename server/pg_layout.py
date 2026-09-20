@@ -34,7 +34,7 @@ PAPERS: dict[str, tuple[float, float]] = {
 MM = 72.0 / 25.4                      # 1 毫米 = 2.8346 点
 
 # 每版页数 -> (列数, 行数, 是否旋转纸面为横向)
-# 2 版横排：纸面转成横向，左右各一页，这是通行做法（也符合 WPS/Word 的 2 版）
+# 2 版横排：纸面转成横向，左右各一页，这是通行做法（多数办公软件的 2 版排版如此）
 NUP_GRID: dict[int, tuple[int, int, bool]] = {
     1: (1, 1, False),
     2: (2, 1, True),
@@ -564,7 +564,7 @@ def compose(plan: dict, images: dict[int, str], out_path: str,
             img = ImageReader(images[key])
             c.saveState()
             if mirror:
-                # 以该版心的竖直中线为轴翻转，即 WPS 的「反片」。
+                # 以该版心的竖直中线为轴翻转，即俗称的「反片」（镜像翻面）。
                 # 放在变换里而非翻转图片本身，旋转版心也能一并正确处理。
                 mid = pl["x"] + pl["w"] / 2.0
                 c.translate(mid, 0)
@@ -600,7 +600,7 @@ def _draw_rotated(c, img, pl: dict) -> None:
 
 
 def _draw_border(c, pl: dict) -> None:
-    """版边框：画在网格单元格上，而不是内容外框 —— 与 WPS 的「版边框」一致。"""
+    """版边框：画在网格单元格上，而不是内容外框 —— 这是「版边框」的通行画法。"""
     c.saveState()
     c.setLineWidth(0.5)
     c.setStrokeColorRGB(0.6, 0.6, 0.6)

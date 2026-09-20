@@ -7,6 +7,50 @@
 Android App 同理：扫码页与设置框都显示 `App <版本> · 构建 <时间戳>`，
 就是为了不再靠「感觉还是不行」来回猜装没装上。
 
+## [v3.12.0] — 合规整改：改用 Apache-2.0、扫码换 ZXing、清掉第三方商标指向
+
+一次以「能不能安心公开分发」为目标的整改，动了三件影响分发的事。
+
+### 变更
+
+- **许可换成 Apache License 2.0**（原 CC BY-NC 4.0）。原来的问题有两处：
+  Creative Commons 官方**不建议**把 CC 协议用于软件（它没有专利授权条款，
+  也不区分源码与目标码），而且 NC 条款不符合 OSI 的开源定义 —— 严格说它
+  不是开源许可。Apache-2.0 含明确的专利授权，商用非商用皆可，代价是要保留
+  版权与许可声明、并标明自己改动过的文件。
+- **安卓扫码从 ML Kit 换成 ZXing。** ML Kit Barcode Scanning 是 Google 的
+  **闭源专有** SDK，带着它，「本项目的依赖全部开源」这句就不成立。改用
+  [ZXing](https://github.com/zxing/zxing) 的 `core`（纯 Java，Apache-2.0）后，
+  服务端与 App 的依赖树全部落在开源许可内。
+  接进 CameraX 有三处必须自己处理，都写进了 `ScanActivity` 的注释：
+  - Y 平面的 `rowStride` **通常大于**图像宽度（行尾有硬件对齐填充），
+    整块 buffer 当 w×h 用会让每行错位、画面变斜条纹，**什么都解不出来且不报错** ——
+    必须按行重排成紧凑数组；
+  - `PlanarYUVLuminanceSource` **不支持旋转**（`rotateCounterClockwise()` 直接抛
+    `UnsupportedOperationException`），得按 `rotationDegrees` 自己转，
+    否则一维码在 90°/270° 下永远解不出来；
+  - `MultiFormatReader` 是**有状态**的，改用无状态的 `decode(bitmap, hints)`，
+    避免 `decodeWithState` 忘记 `reset()` 那类坑。
+- **App 版本 1.1 → 1.2**（`versionCode` 2 → 3）。换了扫码引擎，**装没装上以
+  扫码页 / 设置框里那行 `App 1.2 · 构建 …` 为准** —— 旧包这一行不会变。
+
+### 清理
+
+- 全仓所有拿第三方办公软件（WPS）当类比的表述改为中性描述：README、CHANGELOG、
+  `pg_layout.py`、`print_gateway.py`、`app/README.md`。这些原本只是「大家都熟悉
+  的面板长什么样」的参照物，但公开仓库里没有必要出现别人的商标。
+- README 的许可章节重写为 Apache-2.0；依赖致谢表里 ML Kit 那行换成 ZXing。
+
+### 运维
+
+- **轮换过一次公网访问口令**（设备侧 `PUBLIC_TOKEN`）。起因是早先
+  `make_sticker.py` 的用法示例与 `test_make_sticker.py` 的夹具里写进了真机的
+  隧道域名与 16 位口令，而贴纸印的就是这两项的原文 —— 公开仓库 + 公开口令
+  等于把公网入口送出去。代码已改为占位符，口令另行轮换，两者缺一不可：
+  历史提交里翻得出来，改代码并不能让已泄漏的口令失效。
+
+---
+
 ## [v3.11.2] — 命令行出贴纸：不必为了印一张纸去开公网管理页
 
 ### 新增
@@ -339,6 +383,6 @@ Android App 同理：扫码页与设置框都显示 `App <版本> · 构建 <时
 
 ## 早期版本（未开源）
 
-- **v2.0** — 完整对齐 WPS 打印面板：拼版 / 小册子 / 页边距 / 水印页码 / 裁剪 / 分割 /
+- **v2.0** — 完整的网页打印面板：拼版 / 小册子 / 页边距 / 水印页码 / 裁剪 / 分割 /
   批量合并 / 实时预览；自建拼版引擎取代有问题的 `pdftopdf`
 - **v1.x** — 起步：扫码上传、单页送 CUPS、基础面板

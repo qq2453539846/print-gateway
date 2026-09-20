@@ -4,7 +4,7 @@
 #   1) 用发行版的 python3-reportlab / python3-pil，**不装 pip**。
 #      与裸机部署保持同一条技术路线，也避开 armv7 上编译 wheel 的麻烦。
 #   2) Ghostscript 只通过子进程调用（不链接其库），所以镜像分发
-#      不受 AGPL 传染，与项目的 CC BY-NC 4.0 相容。
+#      不受 AGPL 传染，与项目的 Apache-2.0 分发相容。
 #   3) 多架构：本镜像在 linux/arm/v7 上同样是目标平台 ——
 #      项目本身就跑在一台 1GB 内存的 armv7 小盒子上。
 #

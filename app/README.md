@@ -5,6 +5,7 @@
 - 包名 `com.printgw.selfservice`　显示名「自助打印」
 - minSdk 26（Android 8.0）　targetSdk 34
 - 无第三方网络库，只有 WebView + 一次 `HttpURLConnection` 上传
+- 扫码用 ZXing `core`（纯 Java，Apache-2.0）+ CameraX 取帧，不依赖任何专有 SDK
 
 ## 两种入口
 
@@ -76,7 +77,7 @@ bash build.sh assembleRelease # 用 debug keystore 签名，可直接安装
 
 - 只处理 `content://` / `file://` 的 PDF 与图片（网关本身也只支持这两类）。
 - 微信、QQ 的内置预览器经常**不提供**「用其他应用打开」；文件管理器、
-  WPS、浏览器下载完成后的 PDF 一般都有。
+  浏览器下载完成后的 PDF 一般都有。
 - 部分 ROM（MIUI / ColorOS）对第三方 App 出现在「打开方式」有额外限制，
   需要真机确认。
 

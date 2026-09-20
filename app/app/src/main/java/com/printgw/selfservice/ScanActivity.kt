@@ -9,14 +9,20 @@ import android.view.View
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import com.google.mlkit.vision.barcode.BarcodeScanning
-import com.google.mlkit.vision.barcode.BarcodeScannerOptions
-import com.google.mlkit.vision.barcode.common.Barcode
-import com.google.mlkit.vision.common.InputImage
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.BinaryBitmap
+import com.google.zxing.ChecksumException
+import com.google.zxing.DecodeHintType
+import com.google.zxing.FormatException
+import com.google.zxing.MultiFormatReader
+import com.google.zxing.NotFoundException
+import com.google.zxing.PlanarYUVLuminanceSource
+import com.google.zxing.common.HybridBinarizer
 import com.printgw.selfservice.databinding.ActivityScanBinding
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -27,7 +33,8 @@ import java.util.concurrent.Executors
  * 解析成 host + 口令并存进 Prefs。
  *
  * 设计取舍：
- *  - 识别走 ML Kit 离线模型，不联网、不依赖 Google 服务；
+ *  - 识别走 **ZXing**（纯 Java，Apache-2.0），本地解码、不联网、不依赖 Google 服务，
+ *    也不引入任何专有 SDK —— 整个依赖树都能对上开源许可；
  *  - 本 Activity 只负责「拍到条码」，回传的是**原始文本**；解析规则集中在
  *    `Prefs.parseConnectUrl`（纯函数、可单测），本页只用它做「合格判定」——
  *    不合格的结果继续扫，不打断用户；
@@ -37,15 +44,18 @@ import java.util.concurrent.Executors
  *  - 预览用例是 androidx.camera.core.Preview（不是 camera.view 里那个，
  *    camera.view 只有 PreviewView 这个控件）；
  *  - CameraX 1.3 把 STRATEGY_KEEP_LATEST 改名成 STRATEGY_KEEP_ONLY_LATEST；
- *  - ML Kit 17.2 的 getClient 只收 BarcodeScannerOptions，不再收 int；
- *  - 从 ImageProxy 造输入图要走 ImageProxy.image（android.media.Image）
- *    + 旋转角度，而不是把 ImageProxy 本身塞给 fromMediaImage。
  *  - **addListener 的 executor 必须是主线程的**（ContextCompat.getMainExecutor）。
  *    这个参数只决定「listener 在哪跑」，不影响识别；但 bindToLifecycle 内部
  *    第一件事就是 Threads.checkMainThread()，传后台 Executor 会必然失败。
- *  - **不要开 enableAllPotentialBarcodes()**。它会把「无法解码的潜在条码」也
- *    返回，加上画面文字被误检出来的垃圾串，都会污染结果列表。判定必须落在
- *    「能否解析成连接码」上（见 handleCodes），而不是「rawValue 非空」。
+ *
+ * ZXing 接入注意（踩过的坑，逐条写在对应代码旁）：
+ *  - Y 平面的 `rowStride` **通常大于**图像宽度（行尾有填充），直接整块丢给
+ *    ZXing 会把画面撕成斜条纹，什么都解不出来 —— 必须按行重排成紧凑数组；
+ *  - `PlanarYUVLuminanceSource` **不支持旋转**（`rotateCounterClockwise()`
+ *    直接抛 UnsupportedOperationException），所以旋转得自己做；
+ *  - `MultiFormatReader` 是**有状态**的，用 `decodeWithState` 必须先 `reset()`；
+ *    这里改用无状态的 `decode(bitmap, hints)`，每帧新建 reader，省掉这类状态坑；
+ *  - 默认不限制码制会把资源浪费在无关格式上，显式给 POSSIBLE_FORMATS。
  */
 class ScanActivity : AppCompatActivity() {
 
@@ -53,15 +63,6 @@ class ScanActivity : AppCompatActivity() {
     private val cameraExecutor: ExecutorService by lazy {
         Executors.newSingleThreadExecutor()
     }
-
-    /**
-     * 识别在飞行时置位，避免上一帧还没回来就塞下一帧。
-     *
-     * 写它的有两个线程：`cameraExecutor`（丢弃帧那条路径）与 ML Kit 的主线程回调。
-     * 不加 @Volatile 时两边各看各的缓存，去重可能失效。
-     */
-    @Volatile
-    private var analysing = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -114,54 +115,25 @@ class ScanActivity : AppCompatActivity() {
                     it.setSurfaceProvider(b.preview.surfaceProvider)
                 }
 
-                // 分析帧：每帧丢给 ML Kit 扫码。
+                // 分析帧：每帧丢给 ZXing。
                 // 用 ImageProxy，处理完必须 close() 才能拿到下一帧。
+                //
+                // 不需要防重入标志：analyzer 跑在单线程 executor 上，且这里全程
+                // 同步解码，同一时刻只可能在处理一帧。KEEP_ONLY_LATEST 会自动
+                // 丢弃积压的旧帧，不会因为解码慢而堆积。
                 val analyzer = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .build()
 
-                // 全格式识别：连接码可能是二维码，也可能是普通一维码。
-                // 默认模式（不加任何 options）就是「全部码制」，不需要显式列格式。
-                //
-                // **不要开 enableAllPotentialBarcodes()**。官方文档写得很清楚：它会把
-                // 「即使无法解码」的潜在条码也返回（"a list containing potential
-                // barcodes that were not decoded"）。实测踩过：对着管理页扫时，它
-                // 把单码预览旁边的中文小字误检成一维码，解出一串既没有 `.` 也没有
-                // `:` 的垃圾，被当成「扫到了东西」直接判失败 —— 用户明明对准了二维码，
-                // 却弹「不是有效的连接二维码」。
-                val scanner = BarcodeScanning.getClient(
-                    BarcodeScannerOptions.Builder().build()
-                )
-
                 analyzer.setAnalyzer(cameraExecutor) { imageProxy ->
-                    if (analysing) {
-                        // 上一帧还在识别，丢弃这一帧
+                    try {
+                        onFrameDecoded(decodeFrame(imageProxy), imageProxy.imageInfo.rotationDegrees)
+                    } catch (e: Exception) {
+                        // 单帧解码异常不该让预览中断，记一笔就继续
+                        Log.w(TAG, "解码帧失败", e)
+                    } finally {
                         imageProxy.close()
-                        return@setAnalyzer
                     }
-                    analysing = true
-                    // getImage() 在部分机型/时序下可能拿不到帧，返回 null：跳过这一帧
-                    val mediaImage = imageProxy.image
-                    if (mediaImage == null) {
-                        analysing = false
-                        imageProxy.close()
-                        return@setAnalyzer
-                    }
-                    val input = InputImage.fromMediaImage(
-                        mediaImage,
-                        imageProxy.imageInfo.rotationDegrees
-                    )
-                    // process 的回调跑在主线程
-                    scanner.process(input)
-                        .addOnSuccessListener { codes ->
-                            analysing = false
-                            imageProxy.close()
-                            handleCodes(codes)
-                        }
-                        .addOnFailureListener {
-                            analysing = false
-                            imageProxy.close()
-                        }
                 }
 
                 provider.bindToLifecycle(this, selector, preview, analyzer)
@@ -180,40 +152,144 @@ class ScanActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
+    // ── 解码 ────────────────────────────────────────────────────────────
+
     /**
-     * 从识别结果里挑出**真正能用**的那一个。
+     * 把一帧 YUV_420_888 转成 ZXing 能吃的灰度图并解码。
      *
-     * 光判 `rawValue != null` 是不够的。ML Kit 会同时给出两类「有内容但不是
-     * 连接码」的结果：
-     *   - 解不出内容的潜在条码（rawValue 是空串而非 null）；
-     *   - 把画面里的文字/图案误检成条码，解出一串垃圾。
-     * 以前取 `firstOrNull { it.rawValue != null }` 再直接 `finish()`，这两种
-     * 都会让用户看到「不是有效的连接二维码」—— 明明对准了码，相机也识别到了
-     * 东西，却判失败，且没有第二次机会。
+     * 返回解出的原始文本；没扫到（或扫到但解码失败）返回 null。
+     * 只取**第一个解出结果的那张码** —— 连接码只有一张，多解无意义。
+     */
+    private fun decodeFrame(imageProxy: ImageProxy): String? {
+        val srcW = imageProxy.width
+        val srcH = imageProxy.height
+        if (srcW <= 0 || srcH <= 0) return null
+
+        val plane = imageProxy.planes.firstOrNull() ?: return null
+        val buf = plane.buffer
+        val rowStride = plane.rowStride
+        val pixelStride = plane.pixelStride
+        if (rowStride <= 0 || pixelStride <= 0) return null
+
+        // Y 平面按行重排成紧凑灰度数组。
+        // rowStride 常大于 srcW（硬件按 16/64 字节对齐填行尾），直接把整块 buffer
+        // 当 w×h 用会让每一行都错位，画面变成斜条纹 —— 表现是「明明是清楚的二维码
+        // 却永远识别不出来」，且不会有任何报错。
+        val packed = ByteArray(srcW * srcH)
+        if (rowStride == srcW && pixelStride == 1) {
+            buf.rewind()
+            buf.get(packed, 0, minOf(buf.remaining(), packed.size))
+        } else {
+            val row = ByteArray(rowStride)
+            var out = 0
+            for (y in 0 until srcH) {
+                val base = y * rowStride
+                if (base >= buf.limit()) break
+                buf.position(base)
+                val n = minOf(rowStride, buf.remaining())
+                buf.get(row, 0, n)
+                var x = 0
+                while (x < srcW && x < n) {
+                    packed[out++] = row[x]
+                    x += pixelStride
+                }
+            }
+        }
+
+        val deg = ((imageProxy.imageInfo.rotationDegrees % 360) + 360) % 360
+        val (data, w, h) = rotateGray(packed, srcW, srcH, deg)
+
+        val source = PlanarYUVLuminanceSource(data, w, h, 0, 0, w, h, false)
+        val bitmap = BinaryBitmap(HybridBinarizer(source))
+        return try {
+            MultiFormatReader().decode(bitmap, HINTS).text
+        } catch (e: NotFoundException) {
+            null                       // 这一帧里没有可识别的码 —— 常态，不记日志
+        } catch (e: FormatException) {
+            null                       // 检测到码但内容不合规（损坏/截断）
+        } catch (e: ChecksumException) {
+            null                       // 校验位不过，多半是模糊
+        }
+    }
+
+    /**
+     * 按 CameraX 给的旋转角度把灰度图转正。
      *
-     * 判定标准改成「**能不能解析成连接码**」：
-     *   - 空的 / 解不出的        → 跳过；
-     *   - 解析不出 host[:port]   → 跳过，并在提示条上显示扫到了什么；
-     *   - 解析成功的             → 立刻回传。
-     * 一个都不合格就静静地继续扫下一帧，**不报错、不退出**。
+     * ZXing 的 `PlanarYUVLuminanceSource` 自己不提供旋转（调
+     * `rotateCounterClockwise()` 会抛 UnsupportedOperationException），
+     * 而 90°/270° 时图像是横躺的 —— 二维码识别对方向不敏感还好，
+     * 一维码就完全解不出来，所以必须自己转。
+     *
+     * 映射关系（src 为 w×h）：
+     *   90° ：顺时针，新图 h×w，dst[y][x] = src[h-1-x][y]
+     *   270°：逆时针，新图 h×w，dst[y][x] = src[x][w-1-y]
+     */
+    private fun rotateGray(src: ByteArray, w: Int, h: Int, deg: Int): Triple<ByteArray, Int, Int> {
+        when (deg) {
+            90 -> {
+                val dst = ByteArray(w * h)
+                for (y in 0 until w) {                 // 新图高 = 原宽
+                    val rowBase = y * h                // 新图宽 = 原高
+                    for (x in 0 until h) {
+                        dst[rowBase + x] = src[(h - 1 - x) * w + y]
+                    }
+                }
+                return Triple(dst, h, w)
+            }
+            180 -> {
+                val dst = ByteArray(w * h)
+                for (y in 0 until h) {
+                    val rowBase = y * w
+                    val srcBase = (h - 1 - y) * w
+                    for (x in 0 until w) {
+                        dst[rowBase + x] = src[srcBase + (w - 1 - x)]
+                    }
+                }
+                return Triple(dst, w, h)
+            }
+            270 -> {
+                val dst = ByteArray(w * h)
+                for (y in 0 until w) {                 // 新图高 = 原宽
+                    val rowBase = y * h                // 新图宽 = 原高
+                    for (x in 0 until h) {
+                        dst[rowBase + x] = src[x * w + (w - 1 - y)]
+                    }
+                }
+                return Triple(dst, h, w)
+            }
+            else -> return Triple(src, w, h)
+        }
+    }
+
+    // ── 结果处理 ────────────────────────────────────────────────────────
+
+    /**
+     * 拿到一帧的解码结果后做判定。跑在相机线程上，碰 UI 一律切主线程。
+     *
+     * 光判「解出来了」是不够的：画面里的文字、海报上的图案都可能被当成码解出
+     * 一串垃圾。判定标准是「**能不能解析成连接码**」：
+     *   - 没解出东西            → 什么都不做，静静继续扫；
+     *   - 解出但解析不出 host   → 在提示条上显示扫到了什么，继续扫；
+     *   - 解析成功              → 立刻回传。
+     * 一个都不合格也**不报错、不退出** —— 用户还有下一次机会。
      *
      * 把实际内容显示出来是刻意的：这类问题只能靠现场信息定位，而不是靠猜。
      */
-    private fun handleCodes(codes: List<Barcode>) {
-        var seen: String? = null
-        for (c in codes) {
-            val raw = c.rawValue?.trim().orEmpty()
-            if (raw.isEmpty()) continue
-            if (Prefs.parseConnectUrl(raw) == null) {
-                if (seen == null) seen = raw
-                Log.i(TAG, "忽略不可用结果：format=${c.format} raw=$raw")
-                continue
-            }
-            onScanned(raw)
+    private fun onFrameDecoded(raw: String?, rotation: Int) {
+        val text = raw?.trim().orEmpty()
+        if (text.isEmpty()) return
+
+        if (Prefs.parseConnectUrl(text) != null) {
+            runOnUiThread { onScanned(text) }
             return
         }
-        if (seen != null) {
-            b.msg.text = getString(R.string.scan_seen_not_conn, seen.take(60))
+
+        Log.i(TAG, "忽略不可用结果：rotation=$rotation raw=$text")
+        val shown = text.take(60)
+        runOnUiThread {
+            // 只在内容变化时更新，避免同一串垃圾每帧刷一次
+            val line = getString(R.string.scan_seen_not_conn, shown)
+            if (b.msg.text.toString() != line) b.msg.text = line
         }
     }
 
@@ -234,5 +310,23 @@ class ScanActivity : AppCompatActivity() {
         private const val TAG = "PrintSelfService"
         const val EXTRA_SCAN = "scan_raw"
         private const val REQ_CAMERA = 4001
+
+        /**
+         * 只认连接码可能用到的码制。给死范围既省电也提准确率 ——
+         * 不限制时 ZXing 会把每种一维码都试一遍。
+         *
+         * TRY_HARDER 让它在弱光 / 倾斜 / 小尺寸时多试几种二值化与旋转策略，
+         * 代价是单帧耗时上升；帧率由 KEEP_ONLY_LATEST 兜住，不会堆积。
+         */
+        private val HINTS: Map<DecodeHintType, Any> = mapOf(
+            DecodeHintType.POSSIBLE_FORMATS to listOf(
+                BarcodeFormat.QR_CODE,
+                BarcodeFormat.DATA_MATRIX,
+                BarcodeFormat.CODE_128,
+                BarcodeFormat.CODE_39,
+                BarcodeFormat.EAN_13,
+            ),
+            DecodeHintType.TRY_HARDER to true,
+        )
     }
 }
