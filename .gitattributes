@@ -1,0 +1,36 @@
+# 换行符策略：本仓库一律按 LF 存、按 LF 检出
+#
+# 为什么必须显式写死：
+#
+# Windows 上 Git for Windows 默认 core.autocrlf=true，会在检出时把文本文件
+# 写成 CRLF。而 `docker build` 送进镜像的是**工作区**的文件，不是仓库里的 blob。
+# Dockerfile 用的是 ENTRYPOINT ["/opt/gateway/entrypoint.sh"]（exec 形式），
+# 内核会直接读脚本首行的 shebang，此时它读到的是 `#!/bin/sh\r` ——
+# 内核去找名为 `/bin/sh\r` 的解释器，找不到，于是容器直接起不来，报：
+#
+#     sh: 1: /opt/gateway/entrypoint.sh: not found
+#
+# 这条报错完全看不出与换行符有关，非常难查。同容器内实测确认：
+#   · CRLF 脚本 → not found
+#   · LF   脚本 → 正常执行
+#
+# 所以这里不依赖各人本地的 core.autocrlf 设置，统一按 LF 处理。
+
+* text=auto eol=lf
+
+# 二进制文件：Git 不做任何转换，也不要尝试 diff
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.ico    binary
+*.bmp    binary
+*.webp   binary
+*.pdf    binary
+*.apk    binary
+*.aab    binary
+*.jar    binary
+*.ttf    binary
+*.otf    binary
+*.woff   binary
+*.woff2  binary

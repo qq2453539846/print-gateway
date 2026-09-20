@@ -1,0 +1,18 @@
+# 构建上下文瘦身：镜像里只需要 server/ 与 docker/ 两棵子树。
+# Dockerfile 本身不要列进来（构建器要读它）。
+
+.git
+.gitignore
+.dockerignore
+
+# 安卓工程不进服务端镜像
+app
+
+# 文档与截图不进镜像
+docs
+CHANGELOG.md
+
+# 本地运行产物
+data
+**/__pycache__
+*.py[cod]

@@ -1,11 +1,64 @@
 # 更新日志
 
-本项目遵循「面板徽标 = 实际部署版本」的惯例，`/healthz` 的 `version` 字段是**接口协议版本**
-（硬编码），不用来判断构建是否生效 —— 界面上显示的那个才是。
+本项目遵循「面板徽标 = 实际部署版本」的惯例。面板徽标（`/` 与 `/admin`）和
+`/healthz` 的 `version` 字段取自**同一个常量** `VERSION`（`server/print_gateway.py` 顶部），
+不存在单独的「接口协议版本」—— 所以这三处要么同时是新版、要么同时是旧版，
+拿哪一处判断构建有没有生效都行。发布新版本时只需改这一处。
 Android App 同理：扫码页与设置框都显示 `App <版本> · 构建 <时间戳>`，
 就是为了不再靠「感觉还是不行」来回猜装没装上。
 
-## [未发布] — E2E 落盘队列改为按需建删
+## [v3.11] — Docker 部署、界面截图与样例文件修复
+
+### 新增
+
+- **Docker / Compose 部署**（`Dockerfile`、`docker-compose.yml`、`docker/`）。
+  默认容器内自带 CUPS，USB 打印机经 `devices: /dev/bus/usb` 直通；
+  设了 `CUPS_SERVER` 则切到「只跑网关、连宿主 CUPS」，避免两套队列互相打架。
+  `entrypoint.sh` 起来之前先跑 `cupsd -t` 做配置语法自检 —— 配置写错的表现是
+  「队列在、但打不出来」，比直接退出难查得多
+- README 补界面截图，落在 `docs/screenshots/`
+- **`app/build.sh`** —— `app/README` 一直在讲 `bash build.sh`，仓库里却没有这个文件。
+  补上，且**不含硬编码路径**：SDK 取 `ANDROID_HOME` 或 `local.properties`，
+  Gradle 优先用 wrapper。顺带处理 MSYS 路径 —— `/c/Users/x` 交给原生 `java.exe`
+  会被解释成 `C:\c\Users\x`，报错却是「找不到 SDK」
+
+### 修复
+
+- **`sample_multipage.pdf` 不是合法 PDF** —— `make_testfiles.py` 把 `/Info` 指向
+  **0 号对象**，还把 Info 正文塞进了 `0 0 obj`。0 号在 xref 里是空闲链表头，
+  不是可引用对象。Ghostscript 于是走「修复」路径，**三分页被压成 1 页**，
+  网关的归一化保护（页数变化即拒）立刻把预览挡成 400。
+  这条恰好堵死了 README 里「没有实体打印机也能试」的那条路。
+  修掉后实测：3 页过 gs 仍是 3 页，且不再出现 repair 告警
+- README 概览表的「单元测试 364 项」是旧数字，实跑为 **427 项**
+- **compose 默认映射 `631:631`，在「宿主已装 CUPS」的机器上开箱即失败**。
+  实测报 `Error starting userland proxy: bind: address already in use` —— 而
+  「宿主有 CUPS」偏偏是本项目最常见的场景（网关本来就是包着 CUPS 的）。
+  改成**默认注释掉**，并在注释里写清两件事：想给局域网其他电脑按 IPP 加打印机时怎么打开；
+  以及那种情况更该直接用 `CUPS_SERVER` 模式，让容器别再起第二套 cupsd
+- CHANGELOG 开头称「`/healthz` 的 `version` 是硬编码的接口协议版本，不用来判断构建是否生效」，
+  与实际代码不符：三处徽标（`/`、`/admin`、`/healthz`）都取自同一个 `VERSION` 常量，
+  没有独立的协议版本号。已改为如实描述
+- **新增 `.gitattributes`，锁定换行符为 LF**。Windows 上 Git for Windows 默认
+  `core.autocrlf=true`，检出时会把文本文件写成 CRLF；而 `docker build` 送进镜像的是
+  **工作区**文件，于是 `docker/entrypoint.sh` 首行变成 `#!/bin/sh\r`，容器里
+  `ENTRYPOINT ["/opt/gateway/entrypoint.sh"]` 直接起不来，报
+  `sh: 1: /opt/gateway/entrypoint.sh: not found` —— 报错与换行符看不出关联。
+  同容器内对照实测：CRLF 脚本 `not found`，LF 脚本正常。同一条也保护 `app/build.sh`
+
+### 验证
+
+- 服务端单元测试实跑 427 项全绿，分项 108 / 157 / 23 / 33 / 67 / 14 / 25
+- App `PrefsTest` 20 项全绿（`assembleRelease testDebugUnitTest`）
+- **Docker 镜像实机构建 + 容器实跑**（armv7 设备，Amlogic S805 / Armbian）：
+  镜像 331MB；容器起来后 `entrypoint.sh` 的 `cupsd -t` 自检通过、容器内 cupsd
+  `scheduler is running`；`/healthz` 返回 200；容器内依次实测
+  上传（`/api/upload` → 200，`pages: 3`）、预览（`/api/preview` → 200，
+  `mode: vector`，纸面 595.28×841.89 点）、取图（`/img` → 200，
+  16.9KB 合法 PNG，596×842 RGB）。容器内 `gs` `pdftoppm` `pdfinfo` `lp`
+  `lpstat` `python3` `cupsd` 均在位 —— 依赖表与 Dockerfile 实际装的东西一致
+
+### 同期并入：E2E 落盘队列改为按需建删
 
 > 本条不涉及服务端与 App 代码，设备上部署的仍是 v3.10；改动集中在验证脚本与文档。
 

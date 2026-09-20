@@ -1,0 +1,83 @@
+# 扫码打印网关 —— 一条命令跑起来
+#
+#   docker compose up -d
+#
+# 起来之后：
+#   · 电脑浏览器打开  http://<这台机器的IP>:8080      ← 打印面板
+#   · 手机打开同一地址（或扫管理页印的连接码）         ← 上传就打印
+#   · 局域网其他电脑添加打印机，地址填 <IP>:631（IPP） ← 不需要装同型驱动
+
+services:
+  print-gateway:
+    build:
+      context: .
+      args:
+        # Debian 软件源。默认用阿里云镜像：国内直连 deb.debian.org 实测会
+        # connection timed out，构建卡在 apt-get update 上。
+        # 在境外构建时改回 deb.debian.org 即可。
+        DEBIAN_MIRROR: mirrors.aliyun.com
+    image: print-gateway:local
+    container_name: print-gateway
+
+    # unless-stopped：重启策略只影响容器本身，不动宿主其他服务
+    restart: unless-stopped
+
+    ports:
+      # 网页入口。手机扫码、App、电脑浏览器都进这里
+      - "8080:8080"
+
+      # ── CUPS / IPP 入口（默认关闭，按需打开）────────────────────────
+      # 打开它，局域网其他电脑就能把这条打印机直接加进去：
+      # 地址填 <这台机器的IP>:631，不需要装同型驱动。
+      #
+      # 为什么默认注释掉：
+      #   1) 宿主已经跑着 CUPS 时，631 端口被占用，`docker compose up` 会直接失败：
+      #        Error starting userland proxy: bind: address already in use
+      #      而「宿主有 CUPS」恰恰是本项目最常见的场景 —— 网关本来就是包着 CUPS 的
+      #   2) 那种情况下正确的做法是打开下面 environment 里的 CUPS_SERVER，
+      #      让容器不要再起第二套 cupsd，也就不需要这个映射
+      #
+      # ⚠️ 无论何时都别把 631 暴露到公网 —— IPP 提交作业默认免鉴权
+      # - "631:631"
+
+    environment:
+      TZ: Asia/Shanghai
+      TITLE: 扫码打印
+      # 单文件上传上限（MB）
+      MAX_MB: "50"
+      # 管理页口令。留空 = /admin 整体关闭（本项目不提供无口令的管理页）
+      # ADMIN_TOKEN: "换成你自己的口令"
+      # 界面上展示的访问地址。多网卡机器建议显式指定，否则可能探测到错的那张网卡
+      # HOST_DISPLAY: "192.168.1.10"
+      # 宿主已经装好 CUPS 时填这一行：切到「模式 B」，容器内不再起 cupsd，
+      # 避免两套队列互相打架
+      # CUPS_SERVER: "192.168.1.10:631"
+
+    devices:
+      # USB 打印机直通。
+      # /dev/bus/usb 在 Linux 上总是存在，所以这行不会让容器起不来 ——
+      # 没有打印机时它只是个空目录，插上打印机重建容器即可看到。
+      # 如果你的发行版走 usblp 且希望队列直接用 /dev/usb/lp0，换成：
+      #   - /dev/usb/lp0:/dev/usb/lp0
+      - /dev/bus/usb:/dev/bus/usb
+
+    volumes:
+      # 队列 / PPD / 打印机配置：重建容器不丢
+      - ./data/cups:/etc/cups
+      # 作业与预览缓存
+      - ./data/spool:/var/spool/print-gateway
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 25s
+
+    # ────────────────────────────────────────────────────────────────
+    # 想让 iOS / macOS 在「添加打印机」里自动发现队列？
+    # mDNS 多播出不了默认的 bridge 网络。需要宿主网络栈，做法是：
+    #   1) 把上面 ports: 整段注释掉（host 模式下端口直接绑宿主，不能同时声明映射）
+    #   2) 取消下面这行注释
+    # 不介意手动填 IP 的话，保持现状即可 —— 扫码打印主流程不需要 mDNS。
+    # network_mode: host

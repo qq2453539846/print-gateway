@@ -18,7 +18,8 @@
 | 语言 / 依赖 | 服务端 Python 3（HTTP 服务仅标准库）；Android Kotlin |
 | 实测平台 | Armbian 24.2.1 bookworm / armv7l / 四核 / 988MB 内存 |
 | 服务端体积 | 单文件可部署（`print_gateway.py` 覆盖即升级） |
-| 单元测试 | 364 项全绿 |
+| 单元测试 | 427 项全绿 |
+| 部署方式 | 裸机（systemd）或 Docker；也支持只跑网关、连外部 CUPS |
 
 ---
 
@@ -47,6 +48,31 @@ CUPS 2.4.2 自带的 `/printers/<队列>` 页面本身就能上传打印，但�
 | 没有版面控制 | 只能填原始 CUPS 选项，没有可视化预览、没有拼版 |
 
 本网关用一个标准库服务包住 CUPS 的 `lp`，做成单页移动端界面，并把**排版工作全部搬到网关侧自己完成**。
+
+---
+
+## 界面
+
+左边是**打印预览**，右边是可折叠的**版面选项**。预览与出纸走同一条流水线，
+所以「看起来是这样」和「印出来就是这样」是一回事：
+
+![打印面板](docs/screenshots/02-panel.png)
+
+小册子模式会实时给出装订示意 —— 页号取自与实印同一个函数，图不可能和印出来的东西不一致：
+
+![小册子与装订示意](docs/screenshots/03-booklet.png)
+
+水印与页码在栅格层叠加，字号按**纸面 pt** 换算，与拼版缩放、渲染 dpi 都无关：
+
+![水印与页码](docs/screenshots/05-watermark.png)
+
+手机上是同一套页面的响应式布局，扫码进来就能用：
+
+<img src="docs/screenshots/04-mobile.png" width="330" alt="手机端">
+
+入口页（还没选文件时）：
+
+<img src="docs/screenshots/01-upload.png" width="620" alt="入口页">
 
 ---
 
@@ -108,11 +134,58 @@ server/            服务端（Python 3，HTTP 服务仅标准库）
 
 app/               安卓自助打印 App（Kotlin + CameraX + ML Kit）
   WebView 壳 / 相机扫码连接 / 「打开方式」接收 PDF 与图片
+
+docs/screenshots/  README 用的界面截图
+Dockerfile         容器镜像：debian bookworm + CUPS + gs + poppler + reportlab + Noto CJK
+docker-compose.yml 一条命令跑起来（端口 / 设备直通 / 数据卷 / 健康检查）
+docker/            容器支撑：entrypoint.sh（两种模式）+ cupsd.conf（最小 CUPS 配置）
 ```
 
 ---
 
 ## 快速开始
+
+### 0. Docker（最快，建议先这样试）
+
+```bash
+git clone https://github.com/qq2453539846/print-gateway.git
+cd print-gateway
+docker compose up -d          # 首次会构建镜像，armv7/arm64/amd64 都能构建
+```
+
+然后打开 `http://<这台机器的IP>:8080`。容器里**自带 CUPS**，USB 打印机通过
+`devices: /dev/bus/usb` 直通 —— 插上打印机重建一次容器就会被识别到。
+
+常用环境变量（写在 `docker-compose.yml` 的 `environment:` 下）：
+
+| 变量 | 作用 | 默认 |
+|---|---|---|
+| `PORT` | 网页端口 | `8080` |
+| `TITLE` | 页面标题 | `扫码打印` |
+| `MAX_MB` | 单文件上传上限（MB） | `50` |
+| `ADMIN_TOKEN` | 管理页口令；**留空则 `/admin` 整体关闭** | 空 |
+| `HOST_DISPLAY` | 界面上展示的访问地址（多网卡建议显式指定） | 自动探测 |
+| `PRINTER` | 锁定默认队列 | 跟随 CUPS 默认 |
+| `CUPS_SERVER` | 填了就切到「只跑网关、连宿主 CUPS」模式，容器内不再起 cupsd | 空 |
+| `TOKEN` | 公网端口口令 | 空 |
+
+几件需要知道的事：
+
+- 数据落在 `./data/`（`data/cups` 存队列与 PPD，`data/spool` 存作业）。
+  `docker compose down` 不会丢，`down -v` 才会连数据一起清掉。
+- 631（IPP）**默认不映射**。想让局域网里其他电脑把这条打印机直接加进去
+  （地址填 `<IP>:631`，**不需要装同型驱动**），把 `docker-compose.yml` 里
+  `- "631:631"` 那行的注释去掉即可。默认关掉的原因很实际：宿主已经跑着 CUPS 时
+  631 被占用，`docker compose up` 会直接失败并报
+  `bind: address already in use`，而「宿主有 CUPS」恰恰是本项目最常见的场景 ——
+  网关本来就是包着 CUPS 的。那种情况应当改设 `CUPS_SERVER`，让容器别再起第二套 cupsd，
+  也就不需要这个映射了。
+  无论何时都**绝不能把 631 暴露到公网** —— IPP 提交作业默认免鉴权。
+- 想让 iOS / macOS 在「添加打印机」里自动发现队列，需要 mDNS 出容器：
+  把 compose 里 `ports:` 整段注释掉，再取消 `network_mode: host` 的注释。
+  用不到就别开 —— 扫码打印主流程不依赖自动发现。
+
+---
 
 ### 1. 依赖（设备端）
 

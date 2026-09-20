@@ -94,7 +94,12 @@ def make_pdf(path, pages=1, title="Print Gateway E2E Test"):
                      % (font_id, cid))
 
     objs[font_id] = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
-    objs[0] = "<< /Title (%s) >>" % title
+    # Info 必须是独立对象。曾经写成 `/Info 0 0 R` 并把正文塞进 `0 0 obj`：
+    # 0 号在 xref 里是空闲链表头，不是可引用对象 —— 生成的 PDF 因此不合规，
+    # Ghostscript 只能走「修复」路径，三分页被压成 1 页，
+    # 网关的归一化保护（页数变化即拒）随即把预览挡掉。
+    info_id = font_id + 1
+    objs[info_id] = "<< /Title (%s) >>" % title
 
     out = bytearray(b"%PDF-1.4\n")
     offsets = {}
@@ -107,8 +112,8 @@ def make_pdf(path, pages=1, title="Print Gateway E2E Test"):
     out += b"0000000000 65535 f \n"
     for i in range(1, maxid + 1):
         out += ("%010d 00000 n \n" % offsets[i]).encode()
-    out += ("trailer\n<< /Size %d /Root 1 0 R /Info 0 0 R >>\nstartxref\n%d\n%%%%EOF\n"
-            % (maxid + 1, xref_pos)).encode()
+    out += ("trailer\n<< /Size %d /Root 1 0 R /Info %d 0 R >>\nstartxref\n%d\n%%%%EOF\n"
+            % (maxid + 1, info_id, xref_pos)).encode()
 
     with open(path, "wb") as fh:
         fh.write(bytes(out))

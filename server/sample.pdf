@@ -1,7 +1,4 @@
 %PDF-1.4
-0 0 obj
-<< /Title (Print Gateway E2E Test) >>
-endobj
 1 0 obj
 << /Type /Catalog /Pages 2 0 R >>
 endobj
@@ -35,16 +32,20 @@ endobj
 5 0 obj
 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
 endobj
+6 0 obj
+<< /Title (Print Gateway E2E Test) >>
+endobj
 xref
-0 6
+0 7
 0000000000 65535 f 
-0000000062 00000 n 
-0000000111 00000 n 
-0000000168 00000 n 
-0000000556 00000 n 
-0000000682 00000 n 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000503 00000 n 
+0000000629 00000 n 
+0000000699 00000 n 
 trailer
-<< /Size 6 /Root 1 0 R /Info 0 0 R >>
+<< /Size 7 /Root 1 0 R /Info 6 0 R >>
 startxref
 752
 %%EOF
