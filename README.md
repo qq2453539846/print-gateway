@@ -7,6 +7,7 @@
 只差构建分辨率。
 
 配套一个安卓 App：WebView 壳 + 相机扫码连接 + 「打开方式」直接打印。
+预编译的 APK 在 [Releases](https://github.com/qq2453539846/print-gateway/releases/latest) 下载。
 
 ```
 手机浏览器 / App ──HTTP(S)──> print_gateway.py ──> 排版引擎 ──> CUPS(lp) ──> 打印机
@@ -528,6 +529,9 @@ python3 verify_e2e.py --only 小册子
 `import` 的库，但两者都是宽松许可，允许被更严格的许可再分发 —— 唯一要守的是保留其版权声明。
 
 ### Android 端
+
+预编译包在 [Releases](https://github.com/qq2453539846/print-gateway/releases/latest)
+下载（`print-gateway-1.1.apk`），装上扫管理页的连接码即可用；自行构建见 `app/build.sh`。
 
 | 项目 | 用途 | 许可 |
 |---|---|---|
