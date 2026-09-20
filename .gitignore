@@ -17,6 +17,9 @@ jobs/
 # docker compose 的数据卷（队列配置 / 作业 / 预览缓存）
 data/
 
+# 环境变量：里面是 DDNSTO 令牌、公网口令、管理口令
+.env
+
 # 本机环境
 .DS_Store
 Thumbs.db

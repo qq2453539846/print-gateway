@@ -1242,11 +1242,12 @@ class TestTokenScope(unittest.TestCase):
     """
 
     def _handler(self, token="s3cret", on_tls=False, always=False,
-                 query="", header=None, path="/api/printers"):
+                 query="", header=None, path="/api/printers", public_url=""):
         h = pg.Handler.__new__(pg.Handler)
         h.path = path + query
         h.token = token
         h.token_always = always
+        h.public_url_override = public_url
         h.headers = {}
         if header is not None:
             h.headers["X-Token"] = header
@@ -1278,6 +1279,39 @@ class TestTokenScope(unittest.TestCase):
         self.assertFalse(self._handler(on_tls=False, always=True)._authed())
         self.assertTrue(self._handler(on_tls=False, always=True,
                                       query="?t=s3cret")._authed())
+
+    def test_public_url_covers_plaintext_port(self):
+        """
+        声明了 --public-url 就等于「公网可达」，明文端口也必须校验口令。
+
+        这条曾经漏掉过：启动校验强制「配了 --public-url 就得配 --token」，
+        但 _authed() 的公网判据里没有 public-url ⇒ 内网穿透实例变成**公网免密**，
+        正是启动告警里反复提示「绝不能发生」的那件事。
+        """
+        URL = "https://abc123.kooldns.cn"
+        self.assertFalse(self._handler(on_tls=False, public_url=URL)._authed())
+        self.assertTrue(self._handler(on_tls=False, public_url=URL,
+                                      query="?t=s3cret")._authed())
+        self.assertTrue(self._handler(on_tls=False, public_url=URL,
+                                      header="s3cret")._authed())
+        self.assertFalse(self._handler(on_tls=False, public_url=URL,
+                                       query="?t=nope")._authed())
+
+    def test_empty_public_url_keeps_lan_open(self):
+        """没声明公网地址时明文端口照旧免密 —— 别顺手把内网那条路也锁上。"""
+        self.assertTrue(self._handler(on_tls=False, public_url="")._authed())
+
+    def test_public_url_and_tls_are_equivalent_forms(self):
+        """TLS 端口与 --public-url 是同一件事的两种形态，判据要一致。"""
+        self.assertEqual(self._handler(on_tls=True)._authed(),
+                         self._handler(on_tls=False,
+                                       public_url="https://x.kooldns.cn")._authed())
+
+    def test_authed_counts_public_url_as_public(self):
+        """防回归：公网判据里必须始终含有 public_url_override。"""
+        import inspect
+        src = inspect.getsource(pg.Handler._authed)
+        self.assertIn("public_url_override", src)
 
     def test_missing_server_attribute_fails_open_for_lan(self):
         """单元测试/嵌入式调用下没有 server 属性时，按内网处理而不是崩掉。"""

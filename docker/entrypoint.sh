@@ -16,6 +16,15 @@ TITLE="${TITLE:-扫码打印}"
 
 log() { echo "[entrypoint] $*"; }
 
+# 显式要求口令的部署（如挂到公网的那份实例）：宁可起不来，也不能免密上线。
+# 不能拿「TOKEN 是否为空」直接当判据 —— 内网那份实例本来就该允许空口令，
+# 所以这里要的是一个由部署方式显式声明的开关。
+if [ "${REQUIRE_TOKEN:-}" = "1" ] && [ -z "${TOKEN:-}" ]; then
+    log "错误：REQUIRE_TOKEN=1 但 TOKEN 为空 —— 拒绝启动"
+    log "      公开可达的实例不允许免密（compose 里这个值来自 PUBLIC_TOKEN）"
+    exit 2
+fi
+
 mkdir -p "$SPOOL_DIR"
 
 if [ -n "${CUPS_SERVER:-}" ]; then

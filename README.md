@@ -19,7 +19,7 @@
 | 语言 / 依赖 | 服务端 Python 3（HTTP 服务仅标准库）；Android Kotlin |
 | 实测平台 | Armbian 24.2.1 bookworm / armv7l / 四核 / 988MB 内存 |
 | 服务端体积 | 单文件可部署（`print_gateway.py` 覆盖即升级） |
-| 单元测试 | 440 项全绿 |
+| 单元测试 | 444 项全绿 |
 | 部署方式 | 裸机（systemd）或 Docker；也支持只跑网关、连外部 CUPS |
 
 ---
@@ -157,7 +157,7 @@ docker compose up -d          # 首次会构建镜像，armv7/arm64/amd64 都能
 然后打开 `http://<这台机器的IP>:8080`。容器里**自带 CUPS**，USB 打印机通过
 `devices: /dev/bus/usb` 直通 —— 插上打印机重建一次容器就会被识别到。
 
-常用环境变量（写在 `docker-compose.yml` 的 `environment:` 下）：
+常用环境变量（推荐写在同目录的 `.env`，样板见 `.env.example`）：
 
 | 变量 | 作用 | 默认 |
 |---|---|---|
@@ -173,6 +173,8 @@ docker compose up -d          # 首次会构建镜像，armv7/arm64/amd64 都能
 
 几件需要知道的事：
 
+- 想从外网打印、但既没有公网 IP 也没有自有域名时，加一个 `--profile tunnel`
+  就能把内网穿透一起起起来，见下文「备选：没有公网 IP 时走内网穿透」。
 - 数据落在 `./data/`（`data/cups` 存队列与 PPD，`data/spool` 存作业）。
   `docker compose down` 不会丢，`down -v` 才会连数据一起清掉。
 - 631（IPP）**默认不映射**。想让局域网里其他电脑把这条打印机直接加进去
@@ -367,11 +369,12 @@ Ghostscript 的 `/BeginPage` 等页面钩子对**多页文档只对首页生效*
 （DDNSTO、frp 之类）。思路是把 TLS 挪到隧道边缘，网关这边只跑明文：
 
 ```
-手机 ──https──> xxxx.ddnsto.com ──隧道──> 内网网关 :8081（带口令）──> CUPS
-                └ TLS 在这里终结
+手机 ──https──> 你拿到的地址 ──隧道──> 内网网关 :8081（带口令）──> CUPS
+                   └ TLS 在这里终结
 ```
 
-好处是省掉整套 DNS-01 + acme.sh + 端口映射。代价是**必须额外守三条**：
+好处是省掉整套 DNS-01 + acme.sh + 端口映射，也**不需要自己买域名** ——
+DDNSTO 每个账号自带一个二级域名。代价是**必须额外守三条**：
 
 | # | 要点 | 不守会怎样 |
 |---|---|---|
@@ -379,19 +382,49 @@ Ghostscript 的 `/BeginPage` 等页面钩子对**多页文档只对首页生效*
 | 2 | 用 `--public-url` 告诉网关公网入口在哪 | 不配的话公网链接永远是空的，二维码贴纸里的**「公网码」印不出来** |
 | 3 | 那个实例**不要设 `--admin-token`** | `/admin` 的「仅限内网」判的是源 IP，而穿透客户端就站在局域网里 ⇒ 公网请求的源 IP 是内网地址 ⇒ 这道关被**反向**绕过，只剩口令一层 |
 
-内网那份照旧不动，另起一个公网实例即可：
+#### Docker：一条命令连隧道一起起
+
+`docker-compose.yml` 里已经内置了这两块，都收在 `tunnel` profile 下 ——
+**不启用时它们根本不会起来**，对原有内网部署零影响：
+
+```bash
+cp .env.example .env     # 填 DDNSTO_TOKEN / PUBLIC_TOKEN / PUBLIC_URL
+docker compose --profile tunnel up -d
+```
+
+启用后多两个容器：
+
+| 容器 | 作用 |
+|---|---|
+| `print-gateway-pub` | 8081 端口、**带口令**，复用主容器的 CUPS —— 全机只有一套队列，不必把 USB 再直通一次 |
+| `print-gateway-ddnsto` | 隧道客户端（`linkease/ddnsto`，约 3MB，x86 / arm 都有镜像） |
+
+最后到 DDNSTO 控制台加一条「域名映射」，目标要指到**带口令的那个端口**：
+
+```
+https://你拿到的地址    →    http://<这台机器的IP>:8081
+```
+
+令牌在控制台右上角；同一局域网里跑多台时改 `DEVICE_IDX` 避免设备 ID 撞车。
+
+> `PUBLIC_TOKEN` 留空时 `print-gateway-pub` 会**拒绝启动**，而不是悄悄免密上线。
+> 这是刻意的：挂在公网后面的免密实例没有补救余地。
+
+#### 裸机（非 Docker）：另起一个实例
+
+内网那份照旧不动：
 
 ```bash
 python3 print_gateway.py --port 8081 --token <口令> \
         --spool /var/spool/print-gateway-pub \
-        --public-url https://xxxx.ddnsto.com
+        --public-url https://你拿到的地址
 ```
 
 `--public-url` 与 `--tls-port` 是**同一条铁律的两种形态**：只要公网可达就必须有口令，
 配了它却漏了 `--token` 会**直接拒绝启动**。配上之后，管理页的「公网链接」与二维码贴纸的
 「公网码」都会指向这个地址；漏配 `ADMIN_TOKEN` 时启动日志也会明确告警。
 
-还有两条穿透服务自身的限制要提前知道：
+#### 穿透服务自身的两个限制
 
 - **只转发 HTTP/HTTPS，不转发裸 TCP** ⇒ IPP（631）过不去。打印主流程不受影响，
   受影响的只有「局域网其他电脑加打印机」，而那条路本来就在局域网内用。
@@ -446,7 +479,7 @@ python3 print_gateway.py --port 8081 --token <口令> \
 ## 测试
 
 ```bash
-# 单元测试（440 项）
+# 单元测试（444 项）
 python3 -m unittest test_pg_engine test_print_gateway test_gen_qr \
                      test_pg_dns test_pg_admin test_pg_ddns test_pg_sticker
 

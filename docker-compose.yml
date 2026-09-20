@@ -23,8 +23,10 @@ services:
     restart: unless-stopped
 
     ports:
-      # 网页入口。手机扫码、App、电脑浏览器都进这里
-      - "8080:8080"
+      # 网页入口。手机扫码、App、电脑浏览器都进这里。
+      # 宿主 8080 已被占用时（比如机器上还跑着一个裸机实例）换一个：
+      #   HTTP_PORT=18080 docker compose up -d
+      - "${HTTP_PORT:-8080}:8080"
 
       # ── CUPS / IPP 入口（默认关闭，按需打开）────────────────────────
       # 打开它，局域网其他电脑就能把这条打印机直接加进去：
@@ -41,10 +43,11 @@ services:
       # - "631:631"
 
     environment:
-      TZ: Asia/Shanghai
-      TITLE: 扫码打印
+      # 这几项都可以用同目录的 .env 覆盖（样板见 .env.example）
+      TZ: ${TZ:-Asia/Shanghai}
+      TITLE: ${TITLE:-扫码打印}
       # 单文件上传上限（MB）
-      MAX_MB: "50"
+      MAX_MB: ${MAX_MB:-50}
       # 管理页口令。留空 = /admin 整体关闭（本项目不提供无口令的管理页）
       # ADMIN_TOKEN: "换成你自己的口令"
       # 界面上展示的访问地址。多网卡机器建议显式指定，否则可能探测到错的那张网卡
@@ -73,6 +76,10 @@ services:
       - ./data/cups:/etc/cups
       # 作业与预览缓存
       - ./data/spool:/var/spool/print-gateway
+      # cupsd 的 unix socket 目录。公网那份实例靠它连过来 ——
+      # CUPS 不认带连字符的主机名（会当成 URL scheme），走 socket
+      # 既躲开这个坑，也不必依赖会变的容器 IP。理由详见文档。
+      - ./data/run-cups:/run/cups
 
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/healthz || exit 1"]
@@ -88,3 +95,86 @@ services:
     #   2) 取消下面这行注释
     # 不介意手动填 IP 的话，保持现状即可 —— 扫码打印主流程不需要 mDNS。
     # network_mode: host
+
+  # ═══════════════════════════════════════════════════════════════════
+  #  内网穿透：没有公网 IP、也没有自有域名时的远程访问
+  #
+  #  全部收在 tunnel profile 下 —— 不启用时下面两个服务根本不会起来，
+  #  对原有的内网部署零影响。
+  #
+  #     cp .env.example .env          # 填 DDNSTO_TOKEN / PUBLIC_TOKEN / PUBLIC_URL
+  #     docker compose --profile tunnel up -d
+  #
+  #  起来之后，到 DDNSTO 控制台加一条「域名映射」：
+  #     https://你拿到的地址   →   http://<这台机器的IP>:8081
+  #
+  #  为什么要多起一个实例，而不是让隧道直接指 8080：
+  #    8080 是刻意免密的（内网扫码即用），挂到公网等于「谁访问到谁就能
+  #    上传文件直接打印」。所以对外的必须是带口令的那一份。
+  # ═══════════════════════════════════════════════════════════════════
+
+  print-gateway-pub:
+    build:
+      context: .
+      args:
+        DEBIAN_MIRROR: mirrors.aliyun.com
+    image: print-gateway:local
+    container_name: print-gateway-pub
+    restart: unless-stopped
+    profiles: ["tunnel"]
+
+    ports:
+      # 只给隧道客户端用；不要在小路由器上把它直接 DNAT 出去。
+      # 换了宿主端口的话，DDNSTO 控制台里的映射目标要跟着改
+      - "${PUB_HTTP_PORT:-8081}:8081"
+
+    environment:
+      PORT: "8081"
+      SPOOL_DIR: /var/spool/print-gateway
+      TITLE: ${TITLE:-扫码打印}
+      # 公网入口必须有口令。下面这个开关保证「漏填就起不来」，
+      # 而不是静默降级成一个免密的 8081 挂到隧道后面
+      REQUIRE_TOKEN: "1"
+      TOKEN: ${PUBLIC_TOKEN:-}
+      # 告诉网关公网入口在哪，否则二维码贴纸里的「公网码」印不出来
+      PUBLIC_URL: ${PUBLIC_URL:-}
+      # 复用 print-gateway 容器里的 cupsd：全机只有一套 CUPS、一份队列，
+      # 不必把 USB 再直通一次，也不会出现两套队列互相打架。
+      #
+      # 这里必须写 socket 路径，**不能**写「服务名:631」——
+      # CUPS 会把 print-gateway:631 里的 print-gateway 当成 URL scheme
+      # （字母与连字符都是 scheme 的合法字符），于是报：
+      #   lpstat: Error - add '/version=1.1' to server name.
+      # 换成容器 IP 确实能用，但 IP 会随重建而变；共享 socket 最稳。
+      CUPS_SERVER: /run/cups/cups.sock
+      # ⚠️ 刻意不设 ADMIN_TOKEN：/admin 的「仅限内网」判的是源 IP，而隧道
+      #    客户端就站在局域网里 ⇒ 公网请求的源 IP 是内网地址 ⇒ 这道关会被
+      #    反向绕过。要改配置请走内网那份 8080。
+
+    volumes:
+      # 只挂自己的预览缓存。队列配置留在主容器那份，这里不要重复挂 /etc/cups
+      - ./data/spool-pub:/var/spool/print-gateway
+      # 与主容器共享 cupsd 的 unix socket（对应上面的 CUPS_SERVER）
+      - ./data/run-cups:/run/cups
+
+    depends_on:
+      - print-gateway
+
+  ddnsto:
+    # DDNSTO 客户端（易有云出品），镜像约 3MB，x86 / arm 都有。
+    # 它只往外建连接，隧道是「公网 → 本机」方向的，所以给宿主网络最省事。
+    image: linkease/ddnsto
+    container_name: print-gateway-ddnsto
+    restart: unless-stopped
+    profiles: ["tunnel"]
+    network_mode: host
+
+    environment:
+      # 登录 https://www.ddnsto.com/ ，控制台右上角复制令牌
+      TOKEN: ${DDNSTO_TOKEN:-}
+      # 同一局域网里多台设备跑 ddnsto 时改这里，避免设备 ID 撞车
+      DEVICE_IDX: ${DEVICE_IDX:-0}
+      TZ: ${TZ:-Asia/Shanghai}
+
+    volumes:
+      - /etc/localtime:/etc/localtime:ro

@@ -64,7 +64,7 @@ MAX_UPLOAD_MB = 50
 MAX_FILES = 10
 # 界面版本号（显示在页面右上角）。改动前端时一并递增 ——
 # 用户报「怎么改了没生效」时，第一件事就是看他看到的是哪个版本。
-VERSION = "v3.11.0 0920"
+VERSION = "v3.11.1 0920"
 # 二维码贴纸的版式名（一页印几张）
 _LAYOUT_LABEL = {1: "整页 1 张", 2: "A5 两张", 4: "A6 四张"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".webp"}
@@ -1219,17 +1219,29 @@ class Handler(BaseHTTPRequestHandler):
 
     def _authed(self) -> bool:
         """
-        口令口径：**公网端口（TLS 监听）强制校验，内网明文端口保持免密**。
+        口令口径：**公网可达的入口强制校验，内网明文端口保持免密**。
 
         之所以不在明文端口上也收口令，是因为「扫码即用」正是内网那条路的全部意义 ——
         二维码里是固定 URL，带不了口令。内网免密的安全前提是
         **8080 不做 DNAT**；一旦哪天把 8080 也映射到公网，这里就成了公网免密，
         所以启动日志会把这件事说出来。要在两个端口上都校验，加 `--token-always`。
+
+        「公网可达」有三种形态，三者都必须校验口令：
+
+          1. 本机开了 TLS 监听（``is_tls``）；
+          2. 显式要求（``--token-always``）；
+          3. 声明了 ``--public-url`` —— 内网穿透 / 反向代理那条路。
+
+        第 3 条**曾经漏掉过**：启动时已经强制要求「配了 `--public-url` 就得配
+        `--token`」，但校验这里没把 public-url 算作公网，于是「明文 + public-url」
+        的实例会变成**公网免密**。配了公网地址就等于公网可达，没有例外。
         """
         if not self.token:
             return True
         server = getattr(self, "server", None)
-        on_public = bool(getattr(server, "is_tls", False)) or self.token_always
+        on_public = (bool(getattr(server, "is_tls", False))
+                     or self.token_always
+                     or bool(self.public_url_override))
         if not on_public:
             return True
         q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)

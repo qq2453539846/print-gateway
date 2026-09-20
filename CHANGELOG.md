@@ -7,6 +7,43 @@
 Android App 同理：扫码页与设置框都显示 `App <版本> · 构建 <时间戳>`，
 就是为了不再靠「感觉还是不行」来回猜装没装上。
 
+## [v3.11.1] — 修掉内网穿透下的公网免密（安全修复）
+
+### 修复
+
+- **`--public-url` 没有触发口令校验 ⇒ 内网穿透实例是「公网免密」的。**
+  `Handler._authed()` 判断「这条请求算不算来自公网」时只有两个依据：
+  `server.is_tls` 与 `--token-always`，**唯独没有 `--public-url`**。
+  于是「明文 HTTP + `--public-url`」这种形态——也就是内网穿透 / 反向代理的
+  标准部署——会被判成内网，**任何人不带口令即可调用全部接口**。
+  讽刺的是启动校验当时已经强制要求「配了 `--public-url` 就必须配 `--token`」，
+  告警文案也写着「公网可达就必须有口令」，但鉴权判据没跟上这句话。
+  现在 `--public-url` 与 `--tls-port` 在口令校验上完全等价。
+  实测（Docker / armv7）：修复前 `/api/printers` 无口令返回 200；
+  修复后返回 401，带口令 200，而内网免密那条路不受影响（仍 200）
+- **公网实例复用主容器 cupsd 时，`CUPS_SERVER` 不能写成「服务名:631」。**
+  CUPS 会把 `print-gateway:631` 里的 `print-gateway` 当成 URL scheme
+  （字母和连字符都是 scheme 的合法字符），报
+  `lpstat: Error - add '/version=1.1' to server name.`。
+  实测 `172.19.0.2:631` 可用、服务名不可用，但容器 IP 会随重建而变。
+  改为两个容器共享 cupsd 的 unix socket（`/run/cups/cups.sock`）——
+  既绕开这个坑，也不依赖 IP。实测公网实例直接读到主容器的队列，全机一套 CUPS
+
+### 新增
+
+- **compose 内置内网穿透（`--profile tunnel`）**，对应「没有公网 IP、也没有
+  自有域名时的远程访问」。两个服务：`print-gateway-pub`（8081、带口令、
+  `REQUIRE_TOKEN=1`、复用主容器 cupsd）与 `ddnsto`（`linkease/ddnsto` 隧道客户端）。
+  不启用时完全不参与，对原有内网部署零影响
+- **`.env.example`** —— compose 的环境变量样板。同时把主服务的
+  `TZ` / `TITLE` / `MAX_MB` 改成可由 `.env` 覆盖（原来写的是字面值，
+  在 `.env` 里填了也不生效）
+- **`REQUIRE_TOKEN`** —— entrypoint 的显式开关：声明自己需要口令的部署
+  宁可起不来，也不允许免密上线。不能拿「TOKEN 是否为空」当判据，
+  因为内网那份实例本来就该允许空口令
+- compose 的 `ports` 参数化（`HTTP_PORT` / `PUB_HTTP_PORT`）——
+  宿主 8080 被占用时（例如机器上还跑着一个裸机实例）能换端口
+
 ## [v3.11.0] — Docker 部署、内网穿透支持、界面截图与样例文件修复
 
 ### 新增
