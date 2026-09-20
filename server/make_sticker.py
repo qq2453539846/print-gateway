@@ -34,12 +34,15 @@
 
     # 内网 + 内网穿透：出三张码，公网码里嵌好口令
     python3 make_sticker.py --host 192.168.1.110 --port 8080 \
-        --public-url https://bqpf0po4.gd.ddnsto.com \
-        --token 6433711df8cec344 --out sticker.pdf
+        --public-url https://gw.example.com \
+        --token <你的公网口令> --out sticker.pdf
 
     # 只看内容不落盘（确认 URL 拼得对不对）
     python3 make_sticker.py --host 192.168.1.110 --public-url https://x.example.com \
         --token abc --dry-run
+
+上面的 `--public-url` 与 `--token` 都是**占位符**：请填你自己的隧道域名与口令。
+贴纸里印的就是这两项的原文，别把真实值写进本文件（本仓库是公开的）。
 
 公网链接与网关保持一致：`<public-url 去尾斜杠>/?t=<token>`，
 和 `Handler._public_url()` 的 --public-url 分支逐字符相同 ——

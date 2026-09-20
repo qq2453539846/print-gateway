@@ -71,7 +71,7 @@ class TestAgreesWithGateway(unittest.TestCase):
         return self._handler(public_url, token)._public_url({})
 
     def test_same_string_for_typical_case(self):
-        for pub, tok in (("https://bqpf0po4.gd.ddnsto.com", "6433711df8cec344"),
+        for pub, tok in (("https://gw.example.com", "0123456789abcdef"),
                          ("https://a.example.com/", "tok"),
                          ("https://a.example.com", ""),
                          ("  https://a.example.com  ", "tok")):
@@ -79,14 +79,18 @@ class TestAgreesWithGateway(unittest.TestCase):
                 self.assertEqual(make_sticker.wan_url(pub, tok),
                                  self._gateway_public_url(pub, tok))
 
-    def test_agrees_on_the_real_device_value(self):
-        """真机上用的那一组值也钉一下 —— 域名带数字、口令 16 位十六进制。"""
-        pub = "https://bqpf0po4.gd.ddnsto.com"
-        tok = "6433711df8cec344"
+    def test_agrees_on_a_16_hex_token(self):
+        """隧道域名 + 16 位十六进制口令这一组形态也钉一下。
+
+        注意：这里用的是**假值**。真实域名与口令不进仓库 —— 本仓库是公开的，
+        贴纸里印的就是这两项的原文，写进来等于把公网入口公开。
+        """
+        pub = "https://gw.example.com"
+        tok = "0123456789abcdef"
         self.assertEqual(self._gateway_public_url(pub, tok),
-                         "https://bqpf0po4.gd.ddnsto.com/?t=6433711df8cec344")
+                         "https://gw.example.com/?t=0123456789abcdef")
         self.assertEqual(make_sticker.wan_url(pub, tok),
-                         "https://bqpf0po4.gd.ddnsto.com/?t=6433711df8cec344")
+                         "https://gw.example.com/?t=0123456789abcdef")
 
 
 class TestNetlocDisplay(unittest.TestCase):

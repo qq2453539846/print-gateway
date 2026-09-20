@@ -19,7 +19,7 @@
 | 语言 / 依赖 | 服务端 Python 3（HTTP 服务仅标准库）；Android Kotlin |
 | 实测平台 | Armbian 24.2.1 bookworm / armv7l / 四核 / 988MB 内存 |
 | 服务端体积 | 单文件可部署（`print_gateway.py` 覆盖即升级） |
-| 单元测试 | 444 项全绿 |
+| 单元测试 | 475 项全绿 |
 | 部署方式 | 裸机（systemd）或 Docker；也支持只跑网关、连外部 CUPS |
 
 ---
